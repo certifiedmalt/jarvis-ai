@@ -14,9 +14,22 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
-import { useLLM, LLAMA3_2_1B } from 'react-native-executorch';
+import { useExecutorchStatus } from './_layout';
 
 const { width } = Dimensions.get('window');
+
+// Lazy load the LLM hook only when needed
+let useLLMHook: any = null;
+let LLAMA_MODEL: any = null;
+
+const loadLLM = () => {
+  if (!useLLMHook) {
+    const executorch = require('react-native-executorch');
+    useLLMHook = executorch.useLLM;
+    LLAMA_MODEL = executorch.LLAMA3_2_1B;
+  }
+  return { useLLM: useLLMHook, LLAMA3_2_1B: LLAMA_MODEL };
+};
 
 type Message = {
   id: string;
@@ -25,13 +38,17 @@ type Message = {
   timestamp: Date;
 };
 
-export default function JarvisChat() {
+// Wrapper component that uses the LLM
+function JarvisChatWithLLM() {
   const insets = useSafeAreaInsets();
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
   const scrollViewRef = useRef<ScrollView>(null);
   const pulseAnim = useRef(new Animated.Value(1)).current;
 
+  // Load LLM dynamically
+  const { useLLM, LLAMA3_2_1B } = loadLLM();
+  
   // Initialize local LLM - Llama 3.2 1B
   const llm = useLLM({
     model: LLAMA3_2_1B,
@@ -105,7 +122,6 @@ export default function JarvisChat() {
     setInputText('');
 
     try {
-      // Build conversation history for context
       const chatHistory = [
         {
           role: 'system' as const,
@@ -120,7 +136,6 @@ export default function JarvisChat() {
 
       await llm.generate(chatHistory);
 
-      // Update final response after generation completes
       setMessages((prev) => {
         const updated = [...prev];
         const lastIdx = updated.length - 1;
@@ -189,7 +204,6 @@ export default function JarvisChat() {
     );
   };
 
-  // Get status text
   const getStatusText = () => {
     if (llm.error) return `Error: ${llm.error.message}`;
     if (llm.isModelGenerating) return 'Generating response...';
@@ -274,7 +288,6 @@ export default function JarvisChat() {
                 : 'Loading Llama 3.2 1B model. This may take a moment on first launch...'}
             </Text>
             
-            {/* Capabilities */}
             <View style={styles.capabilitiesContainer}>
               <View style={styles.capabilityItem}>
                 <Ionicons name="chatbubbles" size={24} color="#7B61FF" />
@@ -294,7 +307,6 @@ export default function JarvisChat() {
               </View>
             </View>
 
-            {/* Privacy Badge */}
             <View style={styles.privacyBadge}>
               <Ionicons name="shield-checkmark" size={18} color="#4ECDC4" />
               <Text style={styles.privacyText}>100% Private • Offline • No Cloud</Text>
@@ -344,10 +356,92 @@ export default function JarvisChat() {
   );
 }
 
+// Error display component
+function InitializationError({ error }: { error: string }) {
+  const insets = useSafeAreaInsets();
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    const pulse = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 1.1, duration: 1500, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1, duration: 1500, useNativeDriver: true }),
+      ])
+    );
+    pulse.start();
+    return () => pulse.stop();
+  }, []);
+
+  return (
+    <View style={[styles.container, { paddingTop: insets.top }]}>
+      <View style={styles.errorContainer}>
+        <Animated.View style={[styles.emptyOrb, { transform: [{ scale: pulseAnim }] }]}>
+          <Ionicons name="warning" size={48} color="#FF6B6B" />
+        </Animated.View>
+        <Text style={styles.emptyTitle}>Initialization Error</Text>
+        <Text style={styles.errorMessage}>{error}</Text>
+        <Text style={styles.errorHint}>
+          Please restart the app. If the problem persists, your device may not support local AI models.
+        </Text>
+      </View>
+    </View>
+  );
+}
+
+// Main component that checks initialization status
+export default function JarvisChat() {
+  const { isReady, error } = useExecutorchStatus();
+
+  if (error) {
+    return <InitializationError error={error} />;
+  }
+
+  if (!isReady) {
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color="#00D9FF" />
+        <Text style={styles.loadingText}>Preparing AI Engine...</Text>
+      </View>
+    );
+  }
+
+  return <JarvisChatWithLLM />;
+}
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#0A0A0F',
+  },
+  loadingContainer: {
+    flex: 1,
+    backgroundColor: '#0A0A0F',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  loadingText: {
+    color: '#00D9FF',
+    fontSize: 16,
+    marginTop: 16,
+  },
+  errorContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 30,
+  },
+  errorMessage: {
+    color: '#FF6B6B',
+    fontSize: 14,
+    textAlign: 'center',
+    marginTop: 12,
+    marginBottom: 20,
+  },
+  errorHint: {
+    color: '#666',
+    fontSize: 13,
+    textAlign: 'center',
+    lineHeight: 20,
   },
   header: {
     flexDirection: 'row',
