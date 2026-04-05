@@ -6101,6 +6101,11 @@ react-native-dotenv@^3.4.11:
   dependencies:
     dotenv "^16.4.5"
 
+react-native-executorch-expo-resource-fetcher@^0.8.0:
+  version "0.8.0"
+  resolved "https://registry.yarnpkg.com/react-native-executorch-expo-resource-fetcher/-/react-native-executorch-expo-resource-fetcher-0.8.0.tgz#583c66e26c9729b36001658e5c701b44d20e2476"
+  integrity sha512-vdAne2FBL0nCQ2c2yHTSt8Uttm0Klmo/K7tirSVlKxgVtli4cmsfl+UpR5giaNtlRZ3ImMAMXNW34j0fItmRfQ==
+
 react-native-executorch@^0.8.1:
   version "0.8.1"
   resolved "https://registry.yarnpkg.com/react-native-executorch/-/react-native-executorch-0.8.1.tgz#02330757d194312f67bc92e40869e011b6ae708e"
