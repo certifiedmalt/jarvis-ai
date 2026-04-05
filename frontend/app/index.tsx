@@ -10,12 +10,13 @@ import {
   Platform,
   Animated,
   Dimensions,
+  ActivityIndicator,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import { useLLM, LLAMA3_2_1B } from 'react-native-executorch';
 
 const { width } = Dimensions.get('window');
-const isNative = Platform.OS === 'ios' || Platform.OS === 'android';
 
 type Message = {
   id: string;
@@ -30,11 +31,11 @@ export default function JarvisChat() {
   const [inputText, setInputText] = useState('');
   const scrollViewRef = useRef<ScrollView>(null);
   const pulseAnim = useRef(new Animated.Value(1)).current;
-  
-  // LLM State for native
-  const [llmReady, setLlmReady] = useState(false);
-  const [llmError, setLlmError] = useState<string | null>(null);
-  const [downloadProgress, setDownloadProgress] = useState(0);
+
+  // Initialize local LLM - Llama 3.2 1B
+  const llm = useLLM({
+    model: LLAMA3_2_1B,
+  });
 
   // Pulse animation for Jarvis orb
   useEffect(() => {
@@ -56,18 +57,35 @@ export default function JarvisChat() {
     return () => pulse.stop();
   }, []);
 
-  // Auto-scroll to bottom
+  // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
-    if (scrollViewRef.current && messages.length > 0) {
+    if (scrollViewRef.current) {
       setTimeout(() => {
         scrollViewRef.current?.scrollToEnd({ animated: true });
       }, 100);
     }
-  }, [messages]);
+  }, [messages, llm.response]);
+
+  // Update assistant message with streaming response
+  useEffect(() => {
+    if (llm.response && llm.isModelGenerating) {
+      setMessages((prev) => {
+        const lastMessage = prev[prev.length - 1];
+        if (lastMessage && lastMessage.role === 'assistant') {
+          return prev.map((msg, idx) =>
+            idx === prev.length - 1
+              ? { ...msg, content: llm.response }
+              : msg
+          );
+        }
+        return prev;
+      });
+    }
+  }, [llm.response, llm.isModelGenerating]);
 
   const sendMessage = async () => {
-    if (!inputText.trim()) return;
-    
+    if (!inputText.trim() || !llm.isModelReady || llm.isModelGenerating) return;
+
     const userMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
@@ -78,14 +96,54 @@ export default function JarvisChat() {
     const assistantMessage: Message = {
       id: (Date.now() + 1).toString(),
       role: 'assistant',
-      content: isNative 
-        ? 'To use local Llama 3.2, you need to build this app with Xcode. The react-native-executorch library requires a development build.\n\nSteps:\n1. Run: npx expo prebuild --platform ios\n2. Open ios folder in Xcode\n3. Build and run on your iPhone'
-        : 'Please open this app on your iPhone to use the local Llama 3.2 model. The web preview cannot run local AI models.',
+      content: '',
       timestamp: new Date(),
     };
 
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
+    const userInput = inputText.trim();
     setInputText('');
+
+    try {
+      // Build conversation history for context
+      const chatHistory = [
+        {
+          role: 'system' as const,
+          content: 'You are Jarvis, a highly intelligent AI assistant running locally on this iPhone. You are helpful, concise, and friendly. You help with trading analysis, content creation, book writing, and business planning. Keep responses focused and practical.',
+        },
+        ...messages.slice(-6).map((m) => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content,
+        })),
+        { role: 'user' as const, content: userInput },
+      ];
+
+      await llm.generate(chatHistory);
+
+      // Update final response after generation completes
+      setMessages((prev) => {
+        const updated = [...prev];
+        const lastIdx = updated.length - 1;
+        if (updated[lastIdx]?.role === 'assistant') {
+          updated[lastIdx].content = llm.response || 'I apologize, I could not generate a response.';
+        }
+        return updated;
+      });
+    } catch (error: any) {
+      console.error('Generation error:', error);
+      setMessages((prev) => {
+        const updated = [...prev];
+        const lastIdx = updated.length - 1;
+        if (updated[lastIdx]?.role === 'assistant') {
+          updated[lastIdx].content = `Error: ${error.message || 'Failed to generate response'}`;
+        }
+        return updated;
+      });
+    }
+  };
+
+  const stopGeneration = () => {
+    llm.interrupt();
   };
 
   const clearChat = () => {
@@ -94,6 +152,8 @@ export default function JarvisChat() {
 
   const renderMessage = (message: Message) => {
     const isUser = message.role === 'user';
+    const isGenerating = llm.isModelGenerating && message.role === 'assistant' && message === messages[messages.length - 1];
+    
     return (
       <View
         key={message.id}
@@ -114,8 +174,11 @@ export default function JarvisChat() {
           ]}
         >
           <Text style={[styles.messageText, isUser && styles.userMessageText]}>
-            {message.content}
+            {message.content || (isGenerating ? '...' : '')}
           </Text>
+          {isGenerating && (
+            <ActivityIndicator size="small" color="#00D9FF" style={{ marginTop: 8 }} />
+          )}
         </View>
         {isUser && (
           <View style={styles.avatarContainer}>
@@ -124,6 +187,17 @@ export default function JarvisChat() {
         )}
       </View>
     );
+  };
+
+  // Get status text
+  const getStatusText = () => {
+    if (llm.error) return `Error: ${llm.error.message}`;
+    if (llm.isModelGenerating) return 'Generating response...';
+    if (llm.isModelReady) return 'Llama 3.2 1B • Ready';
+    if (llm.downloadProgress > 0 && llm.downloadProgress < 1) {
+      return `Downloading model... ${Math.round(llm.downloadProgress * 100)}%`;
+    }
+    return 'Initializing Llama 3.2...';
   };
 
   return (
@@ -139,14 +213,15 @@ export default function JarvisChat() {
             style={[
               styles.jarvisOrb,
               { transform: [{ scale: pulseAnim }] },
+              llm.isModelReady && styles.jarvisOrbReady,
             ]}
           >
-            <Ionicons name="planet" size={28} color="#00D9FF" />
+            <Ionicons name="planet" size={28} color={llm.isModelReady ? "#00FF88" : "#00D9FF"} />
           </Animated.View>
           <View>
             <Text style={styles.headerTitle}>JARVIS</Text>
-            <Text style={styles.headerSubtitle}>
-              {isNative ? 'Local AI • Requires Dev Build' : 'Local AI • iPhone Required'}
+            <Text style={[styles.headerSubtitle, llm.isModelReady && styles.headerSubtitleReady]}>
+              {llm.isModelReady ? 'Local AI • Online' : 'Initializing...'}
             </Text>
           </View>
         </View>
@@ -155,15 +230,25 @@ export default function JarvisChat() {
         </TouchableOpacity>
       </View>
 
-      {/* Info Banner */}
-      <View style={styles.infoBanner}>
-        <Ionicons name="information-circle" size={20} color="#00D9FF" />
-        <Text style={styles.infoBannerText}>
-          {isNative 
-            ? 'Development build required for local LLM'
-            : 'Open on iPhone with Expo Go or Dev Build'}
-        </Text>
-      </View>
+      {/* Download Progress */}
+      {llm.downloadProgress > 0 && llm.downloadProgress < 1 && (
+        <View style={styles.progressContainer}>
+          <View style={styles.progressBarBg}>
+            <View style={[styles.progressBar, { width: `${llm.downloadProgress * 100}%` }]} />
+          </View>
+          <Text style={styles.progressText}>
+            Downloading Llama 3.2 1B... {Math.round(llm.downloadProgress * 100)}%
+          </Text>
+        </View>
+      )}
+
+      {/* Error Banner */}
+      {llm.error && (
+        <View style={styles.errorBanner}>
+          <Ionicons name="warning" size={20} color="#FF6B6B" />
+          <Text style={styles.errorText}>{llm.error.message}</Text>
+        </View>
+      )}
 
       {/* Chat Messages */}
       <ScrollView
@@ -184,7 +269,9 @@ export default function JarvisChat() {
             </Animated.View>
             <Text style={styles.emptyTitle}>Hello, I'm Jarvis</Text>
             <Text style={styles.emptySubtitle}>
-              Your standalone AI assistant powered by Llama 3.2 running locally on your device.
+              {llm.isModelReady 
+                ? 'Your standalone AI assistant is ready. I run completely offline on your device.'
+                : 'Loading Llama 3.2 1B model. This may take a moment on first launch...'}
             </Text>
             
             {/* Capabilities */}
@@ -207,51 +294,6 @@ export default function JarvisChat() {
               </View>
             </View>
 
-            {/* Setup Instructions */}
-            <View style={styles.setupCard}>
-              <Text style={styles.setupTitle}>Setup Instructions</Text>
-              
-              <View style={styles.setupStep}>
-                <View style={styles.stepBadge}>
-                  <Text style={styles.stepBadgeText}>1</Text>
-                </View>
-                <View style={styles.setupStepContent}>
-                  <Text style={styles.setupStepTitle}>Prerequisites</Text>
-                  <Text style={styles.setupStepText}>Mac with Xcode, iPhone 12+ with iOS 17+</Text>
-                </View>
-              </View>
-
-              <View style={styles.setupStep}>
-                <View style={styles.stepBadge}>
-                  <Text style={styles.stepBadgeText}>2</Text>
-                </View>
-                <View style={styles.setupStepContent}>
-                  <Text style={styles.setupStepTitle}>Create Dev Build</Text>
-                  <Text style={styles.setupStepText}>npx expo prebuild --platform ios</Text>
-                </View>
-              </View>
-
-              <View style={styles.setupStep}>
-                <View style={styles.stepBadge}>
-                  <Text style={styles.stepBadgeText}>3</Text>
-                </View>
-                <View style={styles.setupStepContent}>
-                  <Text style={styles.setupStepTitle}>Build with Xcode</Text>
-                  <Text style={styles.setupStepText}>Open ios/ folder, build to your iPhone</Text>
-                </View>
-              </View>
-
-              <View style={styles.setupStep}>
-                <View style={styles.stepBadge}>
-                  <Text style={styles.stepBadgeText}>4</Text>
-                </View>
-                <View style={styles.setupStepContent}>
-                  <Text style={styles.setupStepTitle}>Download Model</Text>
-                  <Text style={styles.setupStepText}>Llama 3.2 1B (~1GB) downloads on first launch</Text>
-                </View>
-              </View>
-            </View>
-
             {/* Privacy Badge */}
             <View style={styles.privacyBadge}>
               <Ionicons name="shield-checkmark" size={18} color="#4ECDC4" />
@@ -267,27 +309,36 @@ export default function JarvisChat() {
         <View style={styles.inputRow}>
           <TextInput
             style={styles.textInput}
-            placeholder="Message Jarvis..."
+            placeholder={llm.isModelReady ? "Message Jarvis..." : "Loading model..."}
             placeholderTextColor="#666"
             value={inputText}
             onChangeText={setInputText}
             multiline
             maxLength={2000}
+            editable={llm.isModelReady && !llm.isModelGenerating}
           />
-          <TouchableOpacity
-            style={[
-              styles.sendButton,
-              !inputText.trim() && styles.sendButtonDisabled,
-            ]}
-            onPress={sendMessage}
-            disabled={!inputText.trim()}
-          >
-            <Ionicons name="send" size={22} color="#FFF" />
-          </TouchableOpacity>
+          {llm.isModelGenerating ? (
+            <TouchableOpacity style={styles.stopButton} onPress={stopGeneration}>
+              <Ionicons name="stop" size={24} color="#FF6B6B" />
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity
+              style={[
+                styles.sendButton,
+                (!inputText.trim() || !llm.isModelReady) && styles.sendButtonDisabled,
+              ]}
+              onPress={sendMessage}
+              disabled={!inputText.trim() || !llm.isModelReady}
+            >
+              {!llm.isModelReady ? (
+                <ActivityIndicator size="small" color="#00D9FF" />
+              ) : (
+                <Ionicons name="send" size={22} color="#FFF" />
+              )}
+            </TouchableOpacity>
+          )}
         </View>
-        <Text style={styles.statusText}>
-          Llama 3.2 1B • Local On-Device AI
-        </Text>
+        <Text style={styles.statusText}>{getStatusText()}</Text>
       </View>
     </KeyboardAvoidingView>
   );
@@ -322,6 +373,10 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: 'rgba(0, 217, 255, 0.3)',
   },
+  jarvisOrbReady: {
+    backgroundColor: 'rgba(0, 255, 136, 0.1)',
+    borderColor: 'rgba(0, 255, 136, 0.3)',
+  },
   headerTitle: {
     fontSize: 22,
     fontWeight: '700',
@@ -333,21 +388,44 @@ const styles = StyleSheet.create({
     color: '#00D9FF',
     marginTop: 2,
   },
+  headerSubtitleReady: {
+    color: '#00FF88',
+  },
   clearButton: {
     padding: 10,
   },
-  infoBanner: {
+  progressContainer: {
+    paddingHorizontal: 20,
+    paddingVertical: 15,
+    backgroundColor: '#12121A',
+  },
+  progressBarBg: {
+    height: 6,
+    backgroundColor: '#1A1A25',
+    borderRadius: 3,
+    overflow: 'hidden',
+  },
+  progressBar: {
+    height: '100%',
+    backgroundColor: '#00D9FF',
+    borderRadius: 3,
+  },
+  progressText: {
+    color: '#888',
+    fontSize: 12,
+    marginTop: 8,
+    textAlign: 'center',
+  },
+  errorBanner: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
     paddingHorizontal: 20,
     paddingVertical: 12,
-    backgroundColor: 'rgba(0, 217, 255, 0.1)',
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(0, 217, 255, 0.2)',
+    backgroundColor: 'rgba(255, 107, 107, 0.1)',
   },
-  infoBannerText: {
-    color: '#00D9FF',
+  errorText: {
+    color: '#FF6B6B',
     fontSize: 13,
     flex: 1,
   },
@@ -412,55 +490,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 8,
     textAlign: 'center',
-  },
-  setupCard: {
-    backgroundColor: '#12121A',
-    borderRadius: 20,
-    padding: 20,
-    width: '100%',
-    borderWidth: 1,
-    borderColor: '#1A1A25',
-    marginBottom: 20,
-  },
-  setupTitle: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#FFFFFF',
-    marginBottom: 16,
-    textAlign: 'center',
-  },
-  setupStep: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    marginBottom: 14,
-  },
-  stepBadge: {
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    backgroundColor: '#00D9FF',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 12,
-  },
-  stepBadgeText: {
-    color: '#000',
-    fontWeight: '700',
-    fontSize: 12,
-  },
-  setupStepContent: {
-    flex: 1,
-  },
-  setupStepTitle: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#FFFFFF',
-    marginBottom: 2,
-  },
-  setupStepText: {
-    fontSize: 12,
-    color: '#888',
-    lineHeight: 18,
   },
   privacyBadge: {
     flexDirection: 'row',
@@ -552,6 +581,14 @@ const styles = StyleSheet.create({
   },
   sendButtonDisabled: {
     backgroundColor: '#1A1A25',
+  },
+  stopButton: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: 'rgba(255, 107, 107, 0.2)',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   statusText: {
     fontSize: 11,
