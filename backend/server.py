@@ -23,9 +23,23 @@ mongo_url = os.getenv('MONGO_URL', 'mongodb://localhost:27017')
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.getenv('DB_NAME', 'jarvis_db')]
 
-# OpenAI client
+# Together.ai client (Llama - unrestricted)
+TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# Use Together.ai (Llama) as primary, OpenAI as fallback
+if TOGETHER_API_KEY:
+    openai_client = AsyncOpenAI(api_key=TOGETHER_API_KEY, base_url="https://api.together.xyz/v1")
+    DEFAULT_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    LLM_PROVIDER = "together"
+elif OPENAI_API_KEY:
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    DEFAULT_MODEL = "gpt-4o"
+    LLM_PROVIDER = "openai"
+else:
+    openai_client = None
+    DEFAULT_MODEL = None
+    LLM_PROVIDER = None
 
 # Binance client
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
@@ -97,7 +111,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
-    model: Optional[str] = "gpt-4o"
+    model: Optional[str] = None  # Will use DEFAULT_MODEL
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = 2000
     stream: Optional[bool] = False
@@ -282,7 +296,9 @@ async def root():
 async def health_check():
     return {
         "status": "online",
-        "openai_configured": OPENAI_API_KEY is not None,
+        "llm_provider": LLM_PROVIDER,
+        "llm_model": DEFAULT_MODEL,
+        "llm_configured": openai_client is not None,
         "binance_configured": binance_client is not None,
         "binance_error": binance_error,
         "timestamp": datetime.utcnow().isoformat()
@@ -300,8 +316,9 @@ async def chat(request: ChatRequest):
         for msg in request.messages:
             messages.append({"role": msg.role, "content": msg.content})
 
+        model_to_use = request.model or DEFAULT_MODEL
         response = await openai_client.chat.completions.create(
-            model=request.model,
+            model=model_to_use,
             messages=messages,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
