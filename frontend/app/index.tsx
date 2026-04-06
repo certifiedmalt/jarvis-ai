@@ -29,11 +29,20 @@ export default function JarvisChat() {
   const [isOnline, setIsOnline] = useState(false);
   const scrollViewRef = useRef<ScrollView>(null);
 
+  const [modelName, setModelName] = useState('Connecting...');
+
   useEffect(() => {
     fetch(`${BACKEND_URL}/api/health`)
       .then(res => res.json())
       .then(data => {
-        if (data.status === 'online') setIsOnline(true);
+        if (data.status === 'online') {
+          setIsOnline(true);
+          if (data.llm_model) {
+            const name = data.llm_model.includes('llama') ? 'Llama 3.3 70B' : 
+                         data.llm_model.includes('gpt') ? 'GPT-4o' : data.llm_model;
+            setModelName(name);
+          }
+        }
       })
       .catch(() => setIsOnline(false));
   }, []);
@@ -64,7 +73,7 @@ export default function JarvisChat() {
       const res = await fetch(`${BACKEND_URL}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: history, model: 'gpt-4o' }),
+        body: JSON.stringify({ messages: history }),
       });
 
       const data = await res.json();
@@ -100,7 +109,7 @@ export default function JarvisChat() {
         <View>
           <Text style={styles.headerTitle}>JARVIS</Text>
           <Text style={[styles.headerSub, isOnline && { color: '#00FF88' }]}>
-            {isGenerating ? 'Processing...' : isOnline ? 'GPT-4o Online' : 'Connecting...'}
+            {isGenerating ? 'Processing...' : isOnline ? modelName + ' Online' : 'Connecting...'}
           </Text>
         </View>
       </View>
