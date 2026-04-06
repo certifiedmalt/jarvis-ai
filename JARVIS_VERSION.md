@@ -1,3 +1,9 @@
-# JARVIS v2.5.0
+# JARVIS v2.6.0
 Self-updating AI assistant.
-This file was created and pushed by JARVIS autonomously.
+
+Capabilities:
+- Read own source code
+- Write and update code
+- Push to GitHub
+- Trigger iOS builds
+- Auto-deploy backend via Railway
