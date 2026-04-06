@@ -494,6 +494,14 @@ def extract_text_from_file(filename: str, content: bytes) -> str:
                 if text:
                     text_parts.append(text)
             return '\n'.join(text_parts) if text_parts else '[PDF contained no extractable text]'
+        elif ext in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp', 'tiff'):
+            return f'[Image file: {filename} — {len(content)} bytes, format: {ext.upper()}]'
+        elif ext in ('mp4', 'mov', 'avi', 'mkv', 'webm', 'm4v'):
+            size_mb = len(content) / (1024 * 1024)
+            return f'[Video file: {filename} — {size_mb:.1f}MB, format: {ext.upper()}]'
+        elif ext in ('mp3', 'wav', 'aac', 'm4a', 'ogg', 'flac', 'wma'):
+            size_mb = len(content) / (1024 * 1024)
+            return f'[Audio file: {filename} — {size_mb:.1f}MB, format: {ext.upper()}]'
         else:
             # Try to read as text anyway
             try:
@@ -504,12 +512,17 @@ def extract_text_from_file(filename: str, content: bytes) -> str:
         return f'[Error extracting text from {filename}: {str(e)}]'
 
 
+def is_image_file(filename: str) -> bool:
+    ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
+    return ext in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp', 'tiff')
+
+
 @api_router.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     """Upload a file, extract text, store in MongoDB, return file_id and preview."""
     content = await file.read()
-    if len(content) > 10 * 1024 * 1024:  # 10MB limit
-        raise HTTPException(status_code=400, detail="File too large. Max 10MB.")
+    if len(content) > 50 * 1024 * 1024:  # 50MB limit
+        raise HTTPException(status_code=400, detail="File too large. Max 50MB.")
 
     extracted_text = extract_text_from_file(file.filename or 'unknown', content)
 
@@ -548,11 +561,12 @@ async def chat_with_file(
     temperature: float = Form(0.7),
     max_tokens: int = Form(2000),
 ):
-    """Chat with Jarvis with optional file context."""
+    """Chat with Jarvis with optional file context. Supports text, images, audio, video."""
     if not openai_client:
         raise HTTPException(status_code=500, detail="LLM not configured")
 
     import json as json_mod
+    import base64
     try:
         msg_list = json_mod.loads(messages)
     except Exception:
@@ -561,37 +575,67 @@ async def chat_with_file(
     # Get file context
     file_context = ""
     filename = ""
+    image_base64 = None
+    is_image = False
 
     if file:
         content = await file.read()
-        if len(content) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File too large. Max 10MB.")
-        extracted = extract_text_from_file(file.filename or 'unknown', content)
+        if len(content) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File too large. Max 50MB.")
         filename = file.filename or 'unknown'
-        # Truncate to ~8000 chars to fit in context window
-        file_context = extracted[:8000]
+        is_image = is_image_file(filename)
+
+        if is_image:
+            # Encode image for vision model
+            image_base64 = base64.b64encode(content).decode('utf-8')
+            ext = filename.lower().rsplit('.', 1)[-1]
+            mime_map = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'gif': 'image/gif', 'webp': 'image/webp'}
+            mime_type = mime_map.get(ext, 'image/jpeg')
+        else:
+            extracted = extract_text_from_file(filename, content)
+            file_context = extracted[:8000]
     elif file_id:
         file_doc = await db.files.find_one({"id": file_id})
         if file_doc:
             file_context = file_doc.get("extracted_text", "")[:8000]
             filename = file_doc.get("filename", "unknown")
 
-    # Build messages
-    system_content = JARVIS_SYSTEM_PROMPT
-    if file_context:
-        system_content += f"\n\nThe user has shared a file called '{filename}'. Here is its content:\n---\n{file_context}\n---\nUse this content to answer the user's questions."
-
-    chat_messages = [{"role": "system", "content": system_content}]
-    for msg in msg_list:
-        chat_messages.append({"role": msg["role"], "content": msg["content"]})
-
     try:
-        response = await openai_client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=chat_messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        if is_image and image_base64:
+            # Use vision model for images
+            vision_model = "meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo"
+            user_text = msg_list[-1]["content"] if msg_list else "Describe this image in detail."
+
+            chat_messages = [
+                {"role": "system", "content": JARVIS_SYSTEM_PROMPT},
+                {"role": "user", "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_base64}"}},
+                ]},
+            ]
+
+            response = await openai_client.chat.completions.create(
+                model=vision_model,
+                messages=chat_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        else:
+            # Text-based file or no file
+            system_content = JARVIS_SYSTEM_PROMPT
+            if file_context:
+                system_content += f"\n\nThe user has shared a file called '{filename}'. Here is its content:\n---\n{file_context}\n---\nUse this content to answer the user's questions."
+
+            chat_messages = [{"role": "system", "content": system_content}]
+            for msg in msg_list:
+                chat_messages.append({"role": msg["role"], "content": msg["content"]})
+
+            response = await openai_client.chat.completions.create(
+                model=DEFAULT_MODEL,
+                messages=chat_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
 
         content_text = response.choices[0].message.content
         usage = {
@@ -603,9 +647,9 @@ async def chat_with_file(
         return {
             "id": str(uuid.uuid4()),
             "content": content_text,
-            "model": DEFAULT_MODEL,
+            "model": response.model if hasattr(response, 'model') else DEFAULT_MODEL,
             "usage": usage,
-            "file_used": filename if file_context else None,
+            "file_used": filename if (file_context or image_base64) else None,
         }
 
     except Exception as e:

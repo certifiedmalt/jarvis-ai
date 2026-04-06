@@ -2,7 +2,7 @@
   "expo": {
     "name": "Jarvis",
     "slug": "jarvis",
-    "version": "2.3.1",
+    "version": "2.4.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "frontend",
@@ -16,7 +16,9 @@
         "NSContactsUsageDescription": "Find and manage contacts through Jarvis",
         "NSCalendarsUsageDescription": "View and manage your schedule through Jarvis",
         "NSLocationWhenInUseUsageDescription": "Provide location-aware assistance",
-        "NSPhotoLibraryUsageDescription": "Share photos and files with Jarvis"
+        "NSPhotoLibraryUsageDescription": "Share photos and files with Jarvis",
+        "NSCameraUsageDescription": "Capture photos and videos for Jarvis",
+        "NSMicrophoneUsageDescription": "Record audio and video for Jarvis"
       }
     },
     "android": {

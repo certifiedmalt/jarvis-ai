@@ -11,11 +11,15 @@ import {
   ActivityIndicator,
   Keyboard,
   Alert,
+  ActionSheetIOS,
+  Image,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
 import * as Speech from 'expo-speech';
+import * as ImagePicker from 'expo-image-picker';
+import * as Clipboard from 'expo-clipboard';
 import { parseDeviceActions, executeDeviceAction } from '../utils/deviceActions';
 
 const BACKEND_URL = 'https://jarvis-backend-production-a86c.up.railway.app';
@@ -149,30 +153,136 @@ export default function JarvisChat() {
     }
   }, [isGenerating]);
 
-  const pickFile = useCallback(async () => {
+  const handleAttachment = (asset: { name: string; uri: string; mimeType: string; size: number }) => {
+    if (asset.size > 50 * 1024 * 1024) {
+      Alert.alert('File too large', 'Maximum file size is 50MB.');
+      return;
+    }
+    setAttachedFile({
+      name: asset.name,
+      uri: asset.uri,
+      mimeType: asset.mimeType || 'application/octet-stream',
+      size: asset.size || 0,
+    });
+  };
+
+  const pickFromFiles = useCallback(async () => {
     try {
       const result = await DocumentPicker.getDocumentAsync({
         type: '*/*',
         copyToCacheDirectory: true,
       });
-
-      if (!result.canceled && result.assets && result.assets.length > 0) {
-        const asset = result.assets[0];
-        if (asset.size && asset.size > 10 * 1024 * 1024) {
-          Alert.alert('File too large', 'Maximum file size is 10MB.');
-          return;
-        }
-        setAttachedFile({
-          name: asset.name,
-          uri: asset.uri,
-          mimeType: asset.mimeType || 'application/octet-stream',
-          size: asset.size || 0,
-        });
+      if (!result.canceled && result.assets?.[0]) {
+        const a = result.assets[0];
+        handleAttachment({ name: a.name, uri: a.uri, mimeType: a.mimeType || 'application/octet-stream', size: a.size || 0 });
       }
     } catch (err) {
       console.log('File picker error:', err);
     }
   }, []);
+
+  const pickFromPhotos = useCallback(async () => {
+    try {
+      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert('Permission needed', 'Please allow photo library access in Settings.');
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ['images', 'videos'],
+        quality: 0.8,
+        allowsMultipleSelection: false,
+        videoMaxDuration: 120,
+      });
+      if (!result.canceled && result.assets?.[0]) {
+        const a = result.assets[0];
+        const name = a.fileName || (a.type === 'video' ? 'video.mp4' : 'photo.jpg');
+        const info = await FileSystem.getInfoAsync(a.uri);
+        const size = (info as any).size || 0;
+        handleAttachment({ name, uri: a.uri, mimeType: a.mimeType || (a.type === 'video' ? 'video/mp4' : 'image/jpeg'), size });
+      }
+    } catch (err) {
+      console.log('Photo picker error:', err);
+    }
+  }, []);
+
+  const pickFromCamera = useCallback(async () => {
+    try {
+      const perm = await ImagePicker.requestCameraPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert('Permission needed', 'Please allow camera access in Settings.');
+        return;
+      }
+      const result = await ImagePicker.launchCameraAsync({
+        mediaTypes: ['images', 'videos'],
+        quality: 0.8,
+        videoMaxDuration: 60,
+      });
+      if (!result.canceled && result.assets?.[0]) {
+        const a = result.assets[0];
+        const name = a.fileName || (a.type === 'video' ? 'capture.mp4' : 'capture.jpg');
+        const info = await FileSystem.getInfoAsync(a.uri);
+        const size = (info as any).size || 0;
+        handleAttachment({ name, uri: a.uri, mimeType: a.mimeType || (a.type === 'video' ? 'video/mp4' : 'image/jpeg'), size });
+      }
+    } catch (err) {
+      console.log('Camera error:', err);
+    }
+  }, []);
+
+  const pasteFromClipboard = useCallback(async () => {
+    try {
+      const hasString = await Clipboard.hasStringAsync();
+      const hasImage = await Clipboard.hasImageAsync();
+
+      if (hasImage) {
+        const img = await Clipboard.getImageAsync({ format: 'png' });
+        if (img && img.data) {
+          // Create a temp file from clipboard image
+          const uri = FileSystem.cacheDirectory + 'clipboard_' + Date.now() + '.png';
+          await FileSystem.writeAsStringAsync(uri, img.data, { encoding: FileSystem.EncodingType.Base64 });
+          const info = await FileSystem.getInfoAsync(uri);
+          handleAttachment({ name: 'Pasted Image.png', uri, mimeType: 'image/png', size: (info as any).size || 0 });
+        }
+      } else if (hasString) {
+        const text = await Clipboard.getStringAsync();
+        if (text) {
+          // Paste text directly into the input
+          setInputText(prev => prev + text);
+        }
+      } else {
+        Alert.alert('Clipboard empty', 'Nothing to paste.');
+      }
+    } catch (err) {
+      console.log('Paste error:', err);
+    }
+  }, []);
+
+  const showAttachOptions = useCallback(() => {
+    if (Platform.OS === 'ios') {
+      ActionSheetIOS.showActionSheetWithOptions(
+        {
+          options: ['Cancel', 'Photos & Videos', 'Camera', 'Files', 'Paste'],
+          cancelButtonIndex: 0,
+        },
+        (index) => {
+          if (index === 1) pickFromPhotos();
+          else if (index === 2) pickFromCamera();
+          else if (index === 3) pickFromFiles();
+          else if (index === 4) pasteFromClipboard();
+        },
+      );
+    } else {
+      // Android fallback - show as alert
+      Alert.alert('Attach', 'Choose source', [
+        { text: 'Photos & Videos', onPress: pickFromPhotos },
+        { text: 'Camera', onPress: pickFromCamera },
+        { text: 'Files', onPress: pickFromFiles },
+        { text: 'Paste', onPress: pasteFromClipboard },
+        { text: 'Cancel', style: 'cancel' },
+      ]);
+    }
+  }, [pickFromPhotos, pickFromCamera, pickFromFiles, pasteFromClipboard]);
 
   const removeFile = useCallback(() => {
     setAttachedFile(null);
@@ -404,7 +514,14 @@ export default function JarvisChat() {
       <View style={[styles.inputArea, { paddingBottom: Math.max(insets.bottom, 10) + 8 }]}>
         {attachedFile && (
           <View style={styles.filePreview}>
-            <Text style={styles.filePreviewIcon}>📎</Text>
+            {attachedFile.mimeType.startsWith('image/') ? (
+              <Image source={{ uri: attachedFile.uri }} style={styles.filePreviewImage} />
+            ) : (
+              <Text style={styles.filePreviewIcon}>
+                {attachedFile.mimeType.startsWith('video/') ? '🎬' :
+                 attachedFile.mimeType.startsWith('audio/') ? '🎵' : '📎'}
+              </Text>
+            )}
             <View style={styles.filePreviewInfo}>
               <Text style={styles.filePreviewName} numberOfLines={1}>{attachedFile.name}</Text>
               <Text style={styles.filePreviewSize}>{formatFileSize(attachedFile.size)}</Text>
@@ -417,7 +534,7 @@ export default function JarvisChat() {
         <View style={styles.inputRow}>
           <TouchableOpacity
             style={styles.attachBtn}
-            onPress={pickFile}
+            onPress={showAttachOptions}
             disabled={isGenerating}
           >
             <Text style={[styles.attachIcon, isGenerating && { opacity: 0.3 }]}>+</Text>
@@ -502,6 +619,7 @@ const styles = StyleSheet.create({
     borderRadius: 12, padding: 10, marginBottom: 8, borderWidth: 1, borderColor: '#00D9FF30',
   },
   filePreviewIcon: { fontSize: 20, marginRight: 10 },
+  filePreviewImage: { width: 44, height: 44, borderRadius: 8, marginRight: 10 },
   filePreviewInfo: { flex: 1 },
   filePreviewName: { fontSize: 14, color: '#FFF', fontWeight: '600' },
   filePreviewSize: { fontSize: 11, color: '#888', marginTop: 2 },
