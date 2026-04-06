@@ -363,7 +363,7 @@ async def chat(request: ChatRequest):
 
         return ChatResponse(
             content=content,
-            model=request.model,
+            model=model_to_use,
             usage=usage,
             trading_data=trading_data,
         )
