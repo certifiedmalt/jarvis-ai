@@ -1,0 +1,10 @@
+frontend/
+.git/
+*.md
+.gitignore
+backend/.env
+memory/
+test_result.md
+node_modules/
+__pycache__/
+*.pyc
