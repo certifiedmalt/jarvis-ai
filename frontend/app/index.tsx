@@ -13,7 +13,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-const BACKEND_URL = 'https://portable-llm.preview.emergentagent.com';
+const BACKEND_URL = 'https://jarvis-backend-production-a86c.up.railway.app';
 
 type Message = {
   id: string;
