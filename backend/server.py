@@ -17,6 +17,9 @@ import json
 from fastapi import UploadFile, File, Form
 import io
 import PyPDF2
+import httpx
+import base64
+import subprocess
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -656,6 +659,153 @@ async def chat_with_file(
         error_msg = str(e)
         logger.error(f"Chat with file error: {error_msg}")
         raise HTTPException(status_code=500, detail=f"LLM error: {error_msg}")
+
+
+# ─── JARVIS Self-Update System ─────────────────────────────────────
+REPO_DIR = "/app"
+
+
+class CodeUpdate(BaseModel):
+    file_path: str = Field(..., description="Path relative to repo root, e.g. 'backend/server.py'")
+    content: str = Field(..., description="Full new file content")
+    commit_message: str = Field(default="JARVIS self-update")
+
+
+class MultiCodeUpdate(BaseModel):
+    files: List[CodeUpdate]
+    commit_message: str = Field(default="JARVIS self-update")
+    trigger_build: bool = Field(default=False, description="Trigger EAS build after push")
+
+
+@api_router.get("/code/read/{file_path:path}")
+async def read_code_file(file_path: str):
+    """Read a file from the local repo."""
+    full_path = os.path.join(REPO_DIR, file_path)
+    if not os.path.exists(full_path):
+        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+    try:
+        with open(full_path, "r") as f:
+            content = f.read()
+        return {"file_path": file_path, "content": content, "size": len(content)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/code/list/{dir_path:path}")
+async def list_code_dir(dir_path: str = ""):
+    """List files in a directory."""
+    full_path = os.path.join(REPO_DIR, dir_path) if dir_path else REPO_DIR
+    if not os.path.isdir(full_path):
+        raise HTTPException(status_code=404, detail=f"Directory not found: {dir_path}")
+    items = []
+    for name in sorted(os.listdir(full_path)):
+        if name.startswith(".") or name == "node_modules" or name == "__pycache__":
+            continue
+        item_path = os.path.join(full_path, name)
+        items.append({
+            "name": name,
+            "type": "dir" if os.path.isdir(item_path) else "file",
+            "path": os.path.join(dir_path, name) if dir_path else name,
+            "size": os.path.getsize(item_path) if os.path.isfile(item_path) else 0,
+        })
+    return {"path": dir_path, "files": items}
+
+
+@api_router.post("/code/write")
+async def write_code_file(update: CodeUpdate):
+    """Write a file, commit, and push to GitHub. Railway auto-deploys backend."""
+    full_path = os.path.join(REPO_DIR, update.file_path)
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    try:
+        with open(full_path, "w") as f:
+            f.write(update.content)
+
+        # Git add, commit, push
+        result = subprocess.run(
+            f'cd {REPO_DIR} && git add "{update.file_path}" && git commit -m "{update.commit_message}" && git push origin main',
+            shell=True, capture_output=True, text=True, timeout=30
+        )
+        pushed = result.returncode == 0
+        return {
+            "status": "pushed" if pushed else "committed_locally",
+            "file": update.file_path,
+            "message": update.commit_message,
+            "git_output": (result.stdout + result.stderr)[-300:],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/code/update")
+async def multi_code_update(update: MultiCodeUpdate):
+    """Write multiple files, commit all at once, push, optionally trigger EAS build."""
+    written = []
+    for file_update in update.files:
+        full_path = os.path.join(REPO_DIR, file_update.file_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w") as f:
+            f.write(file_update.content)
+        written.append(file_update.file_path)
+
+    # Git add all, commit, push
+    add_files = " ".join(f'"{f}"' for f in written)
+    result = subprocess.run(
+        f'cd {REPO_DIR} && git add {add_files} && git commit -m "{update.commit_message}" && git push origin main',
+        shell=True, capture_output=True, text=True, timeout=30
+    )
+    pushed = result.returncode == 0
+
+    build_result = None
+    if update.trigger_build:
+        build_result = await trigger_eas_build_internal()
+
+    return {
+        "status": "pushed" if pushed else "commit_failed",
+        "files_updated": written,
+        "message": update.commit_message,
+        "git_output": (result.stdout + result.stderr)[-300:],
+        "build": build_result,
+    }
+
+
+@api_router.post("/build/trigger")
+async def trigger_eas_build_endpoint():
+    """Trigger an EAS build for iOS and submit to TestFlight."""
+    return await trigger_eas_build_internal()
+
+
+async def trigger_eas_build_internal():
+    """Internal: trigger EAS build + TestFlight submit."""
+    try:
+        result = subprocess.run(
+            ["npx", "eas", "build", "--platform", "ios", "--profile", "production", "--non-interactive"],
+            capture_output=True, text=True, timeout=600, cwd="/app/frontend"
+        )
+        build_output = result.stdout + result.stderr
+        build_url = None
+        for line in build_output.split("\n"):
+            if "expo.dev/artifacts" in line:
+                build_url = line.strip()
+
+        submitted = False
+        if result.returncode == 0:
+            submit = subprocess.run(
+                ["npx", "eas", "submit", "--platform", "ios", "--latest", "--non-interactive"],
+                capture_output=True, text=True, timeout=600, cwd="/app/frontend"
+            )
+            submitted = submit.returncode == 0
+
+        return {
+            "status": "success" if result.returncode == 0 else "build_failed",
+            "build_url": build_url,
+            "submitted_to_testflight": submitted,
+            "log": build_output[-500:],
+        }
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "message": "Build timed out"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 # ─── Legacy Routes ─────────────────────────────────────────────────
