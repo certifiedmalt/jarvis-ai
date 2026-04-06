@@ -412,21 +412,9 @@ async def chat(request: ChatRequest):
             "total_tokens": response.usage.total_tokens,
         } if response.usage else None
 
-        # Check if Jarvis included a trading action
-        trading_data = None
-        if '```action' in content:
-            try:
-                action_start = content.index('```action') + len('```action')
-                action_end = content.index('```', action_start)
-                action_json = content[action_start:action_end].strip()
-                action_data = json.loads(action_json)
-                trading_data = process_trading_action(action_data)
-                # Remove the action block from the displayed content
-                content_clean = content[:content.index('```action')].strip()
-                if content_clean:
-                    content = content_clean
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.warning(f"Failed to parse trading action: {e}")
+        # With the new JSON prompt format, the LLM returns pure JSON.
+        # No server-side tool parsing needed — the frontend handles routing.
+        # Just pass through the raw content.
 
         # Save conversation to MongoDB
         try:
@@ -436,7 +424,6 @@ async def chat(request: ChatRequest):
                 "response": content,
                 "model": request.model,
                 "usage": usage,
-                "trading_data": trading_data,
                 "timestamp": datetime.utcnow(),
             })
         except Exception as e:
@@ -446,7 +433,6 @@ async def chat(request: ChatRequest):
             content=content,
             model=model_to_use,
             usage=usage,
-            trading_data=trading_data,
         )
 
     except Exception as e:
@@ -643,7 +629,6 @@ async def chat_with_file(
         raise HTTPException(status_code=500, detail="LLM not configured")
 
     import json as json_mod
-    import base64
     try:
         msg_list = json_mod.loads(messages)
     except Exception:

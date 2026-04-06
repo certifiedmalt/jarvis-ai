@@ -24,8 +24,7 @@ import { Audio } from 'expo-av';
 
 const ELEVENLABS_API_KEY = 'sk_8dd9778f172097e391decb1b8ce43845d40fcbdcbf9cb57d';
 const ELEVENLABS_VOICE_ID = 'WgsC88oU7oxSBORk8LGd'; // User's custom Jarvis 1 voice
-import { parseDeviceActions, executeDeviceAction } from '../utils/deviceActions';
-import { parseSelfUpdateActions, executeSelfUpdate } from '../utils/selfUpdate';
+import { parseJarvisResponse, executeToolAction } from '../utils/jarvisParser';
 
 const BACKEND_URL = 'https://jarvis-backend-production-a86c.up.railway.app';
 
@@ -352,116 +351,77 @@ export default function JarvisChat() {
     setAttachedFile(null);
   }, []);
 
-  // Process self-update actions from JARVIS response
-  const processSelfUpdateActions = useCallback(async (actions: any[], currentMessages: Message[]) => {
-    for (const action of actions) {
-      try {
-        const result = await executeSelfUpdate(action);
+  // Unified tool action processor — handles device, code, trading, and voice actions
+  const processToolAction = useCallback(async (
+    action: string,
+    args: Record<string, any>,
+    currentMessages: Message[],
+  ) => {
+    try {
+      // Execute the tool
+      const { result, category } = await executeToolAction(action, args);
 
-        const updateResultMsg: Message = {
-          id: Date.now().toString() + '_update',
-          role: 'assistant',
-          content: `[Self-Update: ${action.action}]\n${result}`,
-        };
-        setMessages(prev => [...prev, updateResultMsg]);
-
-        // If it was a read or list, send results back to JARVIS
-        if (action.action === 'read' || action.action === 'list') {
-          const followUpMsg: Message = { id: (Date.now() + 2).toString(), role: 'assistant', content: '' };
-          setMessages(prev => [...prev, followUpMsg]);
-          setIsGenerating(true);
-
-          const history = [
-            ...currentMessages.map(m => ({ role: m.role, content: m.content })),
-            { role: 'user' as const, content: `[Code result for ${action.action}]: ${result}` },
-          ].slice(-20);
-
-          const res = await fetch(`${BACKEND_URL}/api/chat`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ messages: history }),
-          });
-          const data = await res.json();
-
-          setMessages(prev => {
-            const updated = [...prev];
-            const last = updated.length - 1;
-            if (updated[last]?.role === 'assistant' && !updated[last].content) {
-              const { cleanText: noDevice } = parseDeviceActions(data.content || '');
-              const { cleanText: finalText, actions: moreUpdates } = parseSelfUpdateActions(noDevice);
-              updated[last] = { ...updated[last], content: finalText };
-              if (moreUpdates.length > 0) {
-                processSelfUpdateActions(moreUpdates, [...updated]);
-              }
-            }
-            return updated;
-          });
-        }
-      } catch (err) {
-        console.log('Self-update error:', err);
-      } finally {
-        setIsGenerating(false);
+      // Voice actions: trigger TTS directly, don't show a separate result bubble
+      if (category === 'voice' && result) {
+        speakText(result, Date.now().toString());
+        return;
       }
+
+      // Show the tool result as a system message
+      const toolResultMsg: Message = {
+        id: Date.now().toString() + '_tool',
+        role: 'assistant',
+        content: `[${category}: ${action}]\n${result}`,
+      };
+      setMessages(prev => [...prev, toolResultMsg]);
+
+      // Send the result back to Jarvis so it can formulate a follow-up
+      const followUpMsg: Message = { id: (Date.now() + 2).toString(), role: 'assistant', content: '' };
+      setMessages(prev => [...prev, followUpMsg]);
+      setIsGenerating(true);
+
+      const history = [
+        ...currentMessages.map(m => ({ role: m.role, content: m.content })),
+        { role: 'user' as const, content: `[Tool result for ${action}]: ${result}` },
+      ].slice(-20);
+
+      const res = await fetch(`${BACKEND_URL}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: history }),
+      });
+      const data = await res.json();
+      const followUpRaw = data.content || '';
+
+      // Parse the follow-up (it might be another tool call — recursive chain)
+      const followUpParsed = parseJarvisResponse(followUpRaw);
+
+      setMessages(prev => {
+        const updated = [...prev];
+        const last = updated.length - 1;
+        if (updated[last]?.role === 'assistant' && !updated[last].content) {
+          if (followUpParsed.type === 'text') {
+            updated[last] = { ...updated[last], content: followUpParsed.text };
+          } else {
+            updated[last] = { ...updated[last], content: `Executing: ${followUpParsed.action}...` };
+            // Recursive: execute the next tool in the chain
+            processToolAction(followUpParsed.action, followUpParsed.args, [...updated]);
+          }
+        }
+        return updated;
+      });
+    } catch (err) {
+      console.log('Tool action error:', err);
+    } finally {
+      setIsGenerating(false);
     }
-  }, []);
+  }, [speakText]);
 
   const formatFileSize = (bytes: number): string => {
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
   };
-
-  // Process device actions from JARVIS response, execute them, and send results back
-  const processDeviceActions = useCallback(async (actions: any[], currentMessages: Message[]) => {
-    for (const action of actions) {
-      try {
-        const result = await executeDeviceAction(action);
-
-        // Add a system message showing the device result
-        const deviceResultMsg: Message = {
-          id: Date.now().toString() + '_device',
-          role: 'assistant',
-          content: `[Device: ${action.action}]\n${result}`,
-        };
-
-        setMessages(prev => [...prev, deviceResultMsg]);
-
-        // Send the result back to JARVIS for a follow-up response
-        const followUpMsg: Message = {
-          id: (Date.now() + 2).toString(),
-          role: 'assistant',
-          content: '',
-        };
-        setMessages(prev => [...prev, followUpMsg]);
-        setIsGenerating(true);
-
-        const history = [
-          ...currentMessages.map(m => ({ role: m.role, content: m.content })),
-          { role: 'user' as const, content: `[Device result for ${action.action}]: ${result}` },
-        ].slice(-20);
-
-        const res = await fetch(`${BACKEND_URL}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: history }),
-        });
-        const data = await res.json();
-
-        setMessages(prev => {
-          const updated = [...prev];
-          const last = updated.length - 1;
-          if (updated[last]?.role === 'assistant' && !updated[last].content) {
-            updated[last] = { ...updated[last], content: data.content || '' };
-          }
-          return updated;
-        });
-      } catch (err) {
-        console.log('Device action error:', err);
-      } finally {
-        setIsGenerating(false);
-      }
-    }
-  }, []);
 
   const sendMessage = useCallback(async () => {
     if ((!inputText.trim() && !attachedFile) || isGenerating) return;
@@ -531,18 +491,17 @@ export default function JarvisChat() {
         const last = updated.length - 1;
         if (updated[last]?.role === 'assistant') {
           const responseText = data.content || 'Empty response from Jarvis.';
-          // Parse and strip device action blocks from displayed text
-          const { cleanText: noDevice, actions: deviceActions } = parseDeviceActions(responseText);
-          const { cleanText: finalText, actions: selfUpdateActions } = parseSelfUpdateActions(noDevice);
-          updated[last] = { ...updated[last], content: finalText || responseText };
 
-          // Execute device actions in background
-          if (deviceActions.length > 0) {
-            processDeviceActions(deviceActions, [...updated]);
-          }
-          // Execute self-update actions in background
-          if (selfUpdateActions.length > 0) {
-            processSelfUpdateActions(selfUpdateActions, [...updated]);
+          // Parse the structured JSON response from Jarvis
+          const parsed = parseJarvisResponse(responseText);
+
+          if (parsed.type === 'text') {
+            // Normal text reply
+            updated[last] = { ...updated[last], content: parsed.text };
+          } else {
+            // Tool call — show status, then execute in background
+            updated[last] = { ...updated[last], content: `Executing: ${parsed.action}...` };
+            processToolAction(parsed.action, parsed.args, [...updated]);
           }
         }
         return updated;
