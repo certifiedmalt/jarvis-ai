@@ -461,10 +461,12 @@ async def chat_stream(request: ChatRequest):
     for msg in request.messages:
         messages.append({"role": msg.role, "content": msg.content})
 
+    model_to_use = request.model or DEFAULT_MODEL
+
     async def generate():
         try:
             stream = await openai_client.chat.completions.create(
-                model=request.model,
+                model=model_to_use,
                 messages=messages,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
