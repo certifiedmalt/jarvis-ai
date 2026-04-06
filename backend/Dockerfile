@@ -2,6 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# v2.2.0 - Force rebuild with new dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
