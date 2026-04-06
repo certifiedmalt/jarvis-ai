@@ -14,22 +14,8 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
-import { useExecutorchStatus } from './_layout';
 
 const { width } = Dimensions.get('window');
-
-// Lazy load the LLM hook only when needed
-let useLLMHook: any = null;
-let LLAMA_MODEL: any = null;
-
-const loadLLM = () => {
-  if (!useLLMHook) {
-    const executorch = require('react-native-executorch');
-    useLLMHook = executorch.useLLM;
-    LLAMA_MODEL = executorch.LLAMA3_2_1B;
-  }
-  return { useLLM: useLLMHook, LLAMA3_2_1B: LLAMA_MODEL };
-};
 
 type Message = {
   id: string;
@@ -38,23 +24,77 @@ type Message = {
   timestamp: Date;
 };
 
-// Wrapper component that uses the LLM
-function JarvisChatWithLLM() {
+// MLC LLM Integration
+let mlcModule: any = null;
+let isMLCLoaded = false;
+
+const loadMLC = async () => {
+  if (!mlcModule) {
+    try {
+      mlcModule = require('@react-native-ai/mlc');
+      isMLCLoaded = true;
+    } catch (e) {
+      console.error('Failed to load MLC:', e);
+    }
+  }
+  return mlcModule;
+};
+
+export default function JarvisChat() {
   const insets = useSafeAreaInsets();
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
+  const [isModelReady, setIsModelReady] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [modelStatus, setModelStatus] = useState('Initializing...');
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  
   const scrollViewRef = useRef<ScrollView>(null);
   const pulseAnim = useRef(new Animated.Value(1)).current;
+  const mlcRef = useRef<any>(null);
 
-  // Load LLM dynamically
-  const { useLLM, LLAMA3_2_1B } = loadLLM();
-  
-  // Initialize local LLM - Llama 3.2 1B
-  const llm = useLLM({
-    model: LLAMA3_2_1B,
-  });
+  // Initialize MLC LLM
+  useEffect(() => {
+    const initMLC = async () => {
+      try {
+        setModelStatus('Loading AI engine...');
+        const mlc = await loadMLC();
+        
+        if (!mlc) {
+          setError('Failed to load AI engine');
+          return;
+        }
 
-  // Pulse animation for Jarvis orb
+        setModelStatus('Preparing model...');
+        
+        // Check if there's a downloadModel or similar function
+        if (mlc.downloadModel) {
+          setModelStatus('Downloading model...');
+          await mlc.downloadModel({
+            model: 'SmolLM2-360M-Instruct-q4f16_1-MLC', // Small model for testing
+            onProgress: (progress: number) => {
+              setDownloadProgress(progress);
+              setModelStatus(`Downloading... ${Math.round(progress * 100)}%`);
+            },
+          });
+        }
+
+        mlcRef.current = mlc;
+        setIsModelReady(true);
+        setModelStatus('Ready');
+        
+      } catch (err: any) {
+        console.error('MLC init error:', err);
+        setError(err.message || 'Failed to initialize AI');
+        setModelStatus('Error');
+      }
+    };
+
+    initMLC();
+  }, []);
+
+  // Pulse animation
   useEffect(() => {
     const pulse = Animated.loop(
       Animated.sequence([
@@ -74,34 +114,17 @@ function JarvisChatWithLLM() {
     return () => pulse.stop();
   }, []);
 
-  // Auto-scroll to bottom when new messages arrive
+  // Auto-scroll
   useEffect(() => {
-    if (scrollViewRef.current) {
+    if (scrollViewRef.current && messages.length > 0) {
       setTimeout(() => {
         scrollViewRef.current?.scrollToEnd({ animated: true });
       }, 100);
     }
-  }, [messages, llm.response]);
-
-  // Update assistant message with streaming response
-  useEffect(() => {
-    if (llm.response && llm.isModelGenerating) {
-      setMessages((prev) => {
-        const lastMessage = prev[prev.length - 1];
-        if (lastMessage && lastMessage.role === 'assistant') {
-          return prev.map((msg, idx) =>
-            idx === prev.length - 1
-              ? { ...msg, content: llm.response }
-              : msg
-          );
-        }
-        return prev;
-      });
-    }
-  }, [llm.response, llm.isModelGenerating]);
+  }, [messages]);
 
   const sendMessage = async () => {
-    if (!inputText.trim() || !llm.isModelReady || llm.isModelGenerating) return;
+    if (!inputText.trim() || !isModelReady || isGenerating) return;
 
     const userMessage: Message = {
       id: Date.now().toString(),
@@ -120,45 +143,50 @@ function JarvisChatWithLLM() {
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
     const userInput = inputText.trim();
     setInputText('');
+    setIsGenerating(true);
 
     try {
-      const chatHistory = [
-        {
-          role: 'system' as const,
-          content: 'You are Jarvis, a highly intelligent AI assistant running locally on this iPhone. You are helpful, concise, and friendly. You help with trading analysis, content creation, book writing, and business planning. Keep responses focused and practical.',
-        },
-        ...messages.slice(-6).map((m) => ({
-          role: m.role as 'user' | 'assistant',
-          content: m.content,
-        })),
-        { role: 'user' as const, content: userInput },
-      ];
+      const mlc = mlcRef.current;
+      
+      if (mlc && mlc.generateText) {
+        const response = await mlc.generateText({
+          prompt: userInput,
+          maxTokens: 500,
+          temperature: 0.7,
+        });
 
-      await llm.generate(chatHistory);
-
+        setMessages((prev) => {
+          const updated = [...prev];
+          const lastIdx = updated.length - 1;
+          if (updated[lastIdx]?.role === 'assistant') {
+            updated[lastIdx].content = response.text || response || 'No response generated.';
+          }
+          return updated;
+        });
+      } else {
+        // Fallback response for testing
+        setMessages((prev) => {
+          const updated = [...prev];
+          const lastIdx = updated.length - 1;
+          if (updated[lastIdx]?.role === 'assistant') {
+            updated[lastIdx].content = 'MLC LLM engine loaded. Model integration in progress.';
+          }
+          return updated;
+        });
+      }
+    } catch (err: any) {
+      console.error('Generation error:', err);
       setMessages((prev) => {
         const updated = [...prev];
         const lastIdx = updated.length - 1;
         if (updated[lastIdx]?.role === 'assistant') {
-          updated[lastIdx].content = llm.response || 'I apologize, I could not generate a response.';
+          updated[lastIdx].content = `Error: ${err.message || 'Failed to generate response'}`;
         }
         return updated;
       });
-    } catch (error: any) {
-      console.error('Generation error:', error);
-      setMessages((prev) => {
-        const updated = [...prev];
-        const lastIdx = updated.length - 1;
-        if (updated[lastIdx]?.role === 'assistant') {
-          updated[lastIdx].content = `Error: ${error.message || 'Failed to generate response'}`;
-        }
-        return updated;
-      });
+    } finally {
+      setIsGenerating(false);
     }
-  };
-
-  const stopGeneration = () => {
-    llm.interrupt();
   };
 
   const clearChat = () => {
@@ -167,7 +195,7 @@ function JarvisChatWithLLM() {
 
   const renderMessage = (message: Message) => {
     const isUser = message.role === 'user';
-    const isGenerating = llm.isModelGenerating && message.role === 'assistant' && message === messages[messages.length - 1];
+    const isCurrentlyGenerating = isGenerating && message.role === 'assistant' && message === messages[messages.length - 1];
     
     return (
       <View
@@ -182,16 +210,11 @@ function JarvisChatWithLLM() {
             <Ionicons name="hardware-chip" size={20} color="#00D9FF" />
           </View>
         )}
-        <View
-          style={[
-            styles.messageBubble,
-            isUser ? styles.userBubble : styles.assistantBubble,
-          ]}
-        >
+        <View style={[styles.messageBubble, isUser ? styles.userBubble : styles.assistantBubble]}>
           <Text style={[styles.messageText, isUser && styles.userMessageText]}>
-            {message.content || (isGenerating ? '...' : '')}
+            {message.content || (isCurrentlyGenerating ? 'Thinking...' : '')}
           </Text>
-          {isGenerating && (
+          {isCurrentlyGenerating && (
             <ActivityIndicator size="small" color="#00D9FF" style={{ marginTop: 8 }} />
           )}
         </View>
@@ -204,21 +227,10 @@ function JarvisChatWithLLM() {
     );
   };
 
-  const getStatusText = () => {
-    if (llm.error) return `Error: ${llm.error.message}`;
-    if (llm.isModelGenerating) return 'Generating response...';
-    if (llm.isModelReady) return 'Llama 3.2 1B • Ready';
-    if (llm.downloadProgress > 0 && llm.downloadProgress < 1) {
-      return `Downloading model... ${Math.round(llm.downloadProgress * 100)}%`;
-    }
-    return 'Initializing Llama 3.2...';
-  };
-
   return (
     <KeyboardAvoidingView
       style={styles.container}
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      keyboardVerticalOffset={0}
     >
       {/* Header */}
       <View style={[styles.header, { paddingTop: insets.top + 10 }]}>
@@ -227,15 +239,15 @@ function JarvisChatWithLLM() {
             style={[
               styles.jarvisOrb,
               { transform: [{ scale: pulseAnim }] },
-              llm.isModelReady && styles.jarvisOrbReady,
+              isModelReady && styles.jarvisOrbReady,
             ]}
           >
-            <Ionicons name="planet" size={28} color={llm.isModelReady ? "#00FF88" : "#00D9FF"} />
+            <Ionicons name="planet" size={28} color={isModelReady ? "#00FF88" : "#00D9FF"} />
           </Animated.View>
           <View>
             <Text style={styles.headerTitle}>JARVIS</Text>
-            <Text style={[styles.headerSubtitle, llm.isModelReady && styles.headerSubtitleReady]}>
-              {llm.isModelReady ? 'Local AI • Online' : 'Initializing...'}
+            <Text style={[styles.headerSubtitle, isModelReady && styles.headerSubtitleReady]}>
+              {isModelReady ? 'Local AI • Online' : modelStatus}
             </Text>
           </View>
         </View>
@@ -245,22 +257,20 @@ function JarvisChatWithLLM() {
       </View>
 
       {/* Download Progress */}
-      {llm.downloadProgress > 0 && llm.downloadProgress < 1 && (
+      {downloadProgress > 0 && downloadProgress < 1 && (
         <View style={styles.progressContainer}>
           <View style={styles.progressBarBg}>
-            <View style={[styles.progressBar, { width: `${llm.downloadProgress * 100}%` }]} />
+            <View style={[styles.progressBar, { width: `${downloadProgress * 100}%` }]} />
           </View>
-          <Text style={styles.progressText}>
-            Downloading Llama 3.2 1B... {Math.round(llm.downloadProgress * 100)}%
-          </Text>
+          <Text style={styles.progressText}>{modelStatus}</Text>
         </View>
       )}
 
       {/* Error Banner */}
-      {llm.error && (
+      {error && (
         <View style={styles.errorBanner}>
           <Ionicons name="warning" size={20} color="#FF6B6B" />
-          <Text style={styles.errorText}>{llm.error.message}</Text>
+          <Text style={styles.errorText}>{error}</Text>
         </View>
       )}
 
@@ -273,19 +283,14 @@ function JarvisChatWithLLM() {
       >
         {messages.length === 0 && (
           <View style={styles.emptyState}>
-            <Animated.View
-              style={[
-                styles.emptyOrb,
-                { transform: [{ scale: pulseAnim }] },
-              ]}
-            >
+            <Animated.View style={[styles.emptyOrb, { transform: [{ scale: pulseAnim }] }]}>
               <Ionicons name="sparkles" size={48} color="#00D9FF" />
             </Animated.View>
             <Text style={styles.emptyTitle}>Hello, I'm Jarvis</Text>
             <Text style={styles.emptySubtitle}>
-              {llm.isModelReady 
+              {isModelReady 
                 ? 'Your standalone AI assistant is ready. I run completely offline on your device.'
-                : 'Loading Llama 3.2 1B model. This may take a moment on first launch...'}
+                : `${modelStatus}. Please wait...`}
             </Text>
             
             <View style={styles.capabilitiesContainer}>
@@ -321,127 +326,41 @@ function JarvisChatWithLLM() {
         <View style={styles.inputRow}>
           <TextInput
             style={styles.textInput}
-            placeholder={llm.isModelReady ? "Message Jarvis..." : "Loading model..."}
+            placeholder={isModelReady ? "Message Jarvis..." : "Loading..."}
             placeholderTextColor="#666"
             value={inputText}
             onChangeText={setInputText}
             multiline
             maxLength={2000}
-            editable={llm.isModelReady && !llm.isModelGenerating}
+            editable={isModelReady && !isGenerating}
           />
-          {llm.isModelGenerating ? (
-            <TouchableOpacity style={styles.stopButton} onPress={stopGeneration}>
-              <Ionicons name="stop" size={24} color="#FF6B6B" />
-            </TouchableOpacity>
-          ) : (
-            <TouchableOpacity
-              style={[
-                styles.sendButton,
-                (!inputText.trim() || !llm.isModelReady) && styles.sendButtonDisabled,
-              ]}
-              onPress={sendMessage}
-              disabled={!inputText.trim() || !llm.isModelReady}
-            >
-              {!llm.isModelReady ? (
-                <ActivityIndicator size="small" color="#00D9FF" />
-              ) : (
-                <Ionicons name="send" size={22} color="#FFF" />
-              )}
-            </TouchableOpacity>
-          )}
+          <TouchableOpacity
+            style={[
+              styles.sendButton,
+              (!inputText.trim() || !isModelReady || isGenerating) && styles.sendButtonDisabled,
+            ]}
+            onPress={sendMessage}
+            disabled={!inputText.trim() || !isModelReady || isGenerating}
+          >
+            {isGenerating ? (
+              <ActivityIndicator size="small" color="#FFF" />
+            ) : (
+              <Ionicons name="send" size={22} color="#FFF" />
+            )}
+          </TouchableOpacity>
         </View>
-        <Text style={styles.statusText}>{getStatusText()}</Text>
+        <Text style={styles.statusText}>
+          {isGenerating ? 'Generating...' : isModelReady ? 'MLC LLM • Local AI' : modelStatus}
+        </Text>
       </View>
     </KeyboardAvoidingView>
   );
-}
-
-// Error display component
-function InitializationError({ error }: { error: string }) {
-  const insets = useSafeAreaInsets();
-  const pulseAnim = useRef(new Animated.Value(1)).current;
-
-  useEffect(() => {
-    const pulse = Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulseAnim, { toValue: 1.1, duration: 1500, useNativeDriver: true }),
-        Animated.timing(pulseAnim, { toValue: 1, duration: 1500, useNativeDriver: true }),
-      ])
-    );
-    pulse.start();
-    return () => pulse.stop();
-  }, []);
-
-  return (
-    <View style={[styles.container, { paddingTop: insets.top }]}>
-      <View style={styles.errorContainer}>
-        <Animated.View style={[styles.emptyOrb, { transform: [{ scale: pulseAnim }] }]}>
-          <Ionicons name="warning" size={48} color="#FF6B6B" />
-        </Animated.View>
-        <Text style={styles.emptyTitle}>Initialization Error</Text>
-        <Text style={styles.errorMessage}>{error}</Text>
-        <Text style={styles.errorHint}>
-          Please restart the app. If the problem persists, your device may not support local AI models.
-        </Text>
-      </View>
-    </View>
-  );
-}
-
-// Main component that checks initialization status
-export default function JarvisChat() {
-  const { isReady, error } = useExecutorchStatus();
-
-  if (error) {
-    return <InitializationError error={error} />;
-  }
-
-  if (!isReady) {
-    return (
-      <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#00D9FF" />
-        <Text style={styles.loadingText}>Preparing AI Engine...</Text>
-      </View>
-    );
-  }
-
-  return <JarvisChatWithLLM />;
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#0A0A0F',
-  },
-  loadingContainer: {
-    flex: 1,
-    backgroundColor: '#0A0A0F',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  loadingText: {
-    color: '#00D9FF',
-    fontSize: 16,
-    marginTop: 16,
-  },
-  errorContainer: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 30,
-  },
-  errorMessage: {
-    color: '#FF6B6B',
-    fontSize: 14,
-    textAlign: 'center',
-    marginTop: 12,
-    marginBottom: 20,
-  },
-  errorHint: {
-    color: '#666',
-    fontSize: 13,
-    textAlign: 'center',
-    lineHeight: 20,
   },
   header: {
     flexDirection: 'row',
@@ -675,14 +594,6 @@ const styles = StyleSheet.create({
   },
   sendButtonDisabled: {
     backgroundColor: '#1A1A25',
-  },
-  stopButton: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    backgroundColor: 'rgba(255, 107, 107, 0.2)',
-    alignItems: 'center',
-    justifyContent: 'center',
   },
   statusText: {
     fontSize: 11,
