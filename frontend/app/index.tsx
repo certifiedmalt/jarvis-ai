@@ -20,6 +20,10 @@ import * as FileSystem from 'expo-file-system';
 import * as Speech from 'expo-speech';
 import * as ImagePicker from 'expo-image-picker';
 import * as Clipboard from 'expo-clipboard';
+import { Audio } from 'expo-av';
+
+const ELEVENLABS_API_KEY = 'sk_8dd9778f172097e391decb1b8ce43845d40fcbdcbf9cb57d';
+const ELEVENLABS_VOICE_ID = 'WgsC88oU7oxSBORk8LGd'; // User's custom Jarvis 1 voice
 import { parseDeviceActions, executeDeviceAction } from '../utils/deviceActions';
 
 const BACKEND_URL = 'https://jarvis-backend-production-a86c.up.railway.app';
@@ -74,9 +78,16 @@ export default function JarvisChat() {
     }
   }, [messages]);
 
-  // TTS functions
+  // TTS functions - ElevenLabs first, iOS TTS fallback
+  const soundRef = useRef<Audio.Sound | null>(null);
+
   const speakText = useCallback(async (text: string, msgId: string) => {
     // Stop any current speech
+    if (soundRef.current) {
+      await soundRef.current.stopAsync().catch(() => {});
+      await soundRef.current.unloadAsync().catch(() => {});
+      soundRef.current = null;
+    }
     const speaking = await Speech.isSpeakingAsync();
     if (speaking) await Speech.stop();
 
@@ -94,7 +105,72 @@ export default function JarvisChat() {
     setIsSpeaking(true);
     setSpeakingMsgId(msgId);
 
-    // Find best available British voice, fallback to default
+    // Try ElevenLabs first (called from phone directly)
+    try {
+      await Audio.setAudioModeAsync({
+        playsInSilentModeIOS: true,
+        staysActiveInBackground: false,
+      });
+
+      const response = await fetch(
+        `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
+        {
+          method: 'POST',
+          headers: {
+            'xi-api-key': ELEVENLABS_API_KEY,
+            'Content-Type': 'application/json',
+            'Accept': 'audio/mpeg',
+          },
+          body: JSON.stringify({
+            text: cleanText.substring(0, 2500),
+            model_id: 'eleven_multilingual_v2',
+            voice_settings: {
+              stability: 0.6,
+              similarity_boost: 0.85,
+              style: 0.2,
+            },
+          }),
+        }
+      );
+
+      if (response.ok) {
+        const audioBlob = await response.blob();
+        const reader = new FileReader();
+        const base64Audio = await new Promise<string>((resolve, reject) => {
+          reader.onloadend = () => {
+            const result = reader.result as string;
+            resolve(result.split(',')[1]);
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(audioBlob);
+        });
+
+        const fileUri = FileSystem.cacheDirectory + `jarvis_${Date.now()}.mp3`;
+        await FileSystem.writeAsStringAsync(fileUri, base64Audio, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+
+        const { sound } = await Audio.Sound.createAsync(
+          { uri: fileUri },
+          { shouldPlay: true }
+        );
+        soundRef.current = sound;
+
+        sound.setOnPlaybackStatusUpdate((status) => {
+          if (status.isLoaded && status.didJustFinish) {
+            setIsSpeaking(false);
+            setSpeakingMsgId(null);
+            sound.unloadAsync().catch(() => {});
+            soundRef.current = null;
+          }
+        });
+        return; // ElevenLabs worked
+      }
+    } catch (e) {
+      console.log('ElevenLabs TTS failed, falling back to device:', e);
+    }
+
+    // Fallback to iOS device TTS
     let voiceId: string | undefined;
     try {
       const voices = await Speech.getAvailableVoicesAsync();
@@ -105,40 +181,27 @@ export default function JarvisChat() {
       ) || voices.find(v =>
         v.language.startsWith('en')
       );
-      if (britishVoice) {
-        voiceId = britishVoice.identifier;
-      }
-    } catch (e) {
-      // Fall back to language-only
-    }
+      if (britishVoice) voiceId = britishVoice.identifier;
+    } catch (e) {}
 
     const options: Speech.SpeechOptions = {
       language: 'en-GB',
       pitch: 0.95,
       rate: Platform.OS === 'ios' ? 0.52 : 0.9,
-      onDone: () => {
-        setIsSpeaking(false);
-        setSpeakingMsgId(null);
-      },
-      onStopped: () => {
-        setIsSpeaking(false);
-        setSpeakingMsgId(null);
-      },
-      onError: (error) => {
-        console.log('Speech error:', error);
-        setIsSpeaking(false);
-        setSpeakingMsgId(null);
-      },
+      onDone: () => { setIsSpeaking(false); setSpeakingMsgId(null); },
+      onStopped: () => { setIsSpeaking(false); setSpeakingMsgId(null); },
+      onError: () => { setIsSpeaking(false); setSpeakingMsgId(null); },
     };
-
-    if (voiceId) {
-      options.voice = voiceId;
-    }
-
+    if (voiceId) options.voice = voiceId;
     Speech.speak(cleanText, options);
   }, []);
 
   const stopSpeaking = useCallback(async () => {
+    if (soundRef.current) {
+      await soundRef.current.stopAsync().catch(() => {});
+      await soundRef.current.unloadAsync().catch(() => {});
+      soundRef.current = null;
+    }
     await Speech.stop();
     setIsSpeaking(false);
     setSpeakingMsgId(null);
