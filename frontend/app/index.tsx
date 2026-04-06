@@ -15,6 +15,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
+import * as Speech from 'expo-speech';
 import { parseDeviceActions, executeDeviceAction } from '../utils/deviceActions';
 
 const BACKEND_URL = 'https://jarvis-backend-production-a86c.up.railway.app';
@@ -40,6 +41,9 @@ export default function JarvisChat() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [isOnline, setIsOnline] = useState(false);
   const [attachedFile, setAttachedFile] = useState<AttachedFile | null>(null);
+  const [autoRead, setAutoRead] = useState(true);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
   const scrollViewRef = useRef<ScrollView>(null);
 
   const [modelName, setModelName] = useState('Connecting...');
@@ -65,6 +69,59 @@ export default function JarvisChat() {
       setTimeout(() => scrollViewRef.current?.scrollToEnd({ animated: true }), 100);
     }
   }, [messages]);
+
+  // TTS functions
+  const speakText = useCallback(async (text: string, msgId: string) => {
+    // Stop any current speech
+    await Speech.stop();
+
+    // Clean text - remove code blocks, action blocks, JSON
+    const cleanText = text
+      .replace(/```[\s\S]*?```/g, '')
+      .replace(/\{[\s\S]*?\}/g, '')
+      .replace(/\[Device:.*?\]/g, '')
+      .replace(/\n+/g, ' ')
+      .trim();
+
+    if (!cleanText) return;
+
+    setIsSpeaking(true);
+    setSpeakingMsgId(msgId);
+
+    Speech.speak(cleanText, {
+      language: 'en-GB',
+      pitch: 0.95,
+      rate: Platform.OS === 'ios' ? 0.52 : 0.9,
+      voice: Platform.OS === 'ios' ? 'com.apple.speech.synthesis.voice.Daniel' : undefined,
+      onDone: () => {
+        setIsSpeaking(false);
+        setSpeakingMsgId(null);
+      },
+      onStopped: () => {
+        setIsSpeaking(false);
+        setSpeakingMsgId(null);
+      },
+      onError: () => {
+        setIsSpeaking(false);
+        setSpeakingMsgId(null);
+      },
+    });
+  }, []);
+
+  const stopSpeaking = useCallback(async () => {
+    await Speech.stop();
+    setIsSpeaking(false);
+    setSpeakingMsgId(null);
+  }, []);
+
+  // Auto-read new assistant messages
+  useEffect(() => {
+    if (!autoRead || messages.length === 0 || isGenerating) return;
+    const lastMsg = messages[messages.length - 1];
+    if (lastMsg.role === 'assistant' && lastMsg.content && lastMsg.content.length > 0) {
+      speakText(lastMsg.content, lastMsg.id);
+    }
+  }, [isGenerating]);
 
   const pickFile = useCallback(async () => {
     try {
@@ -252,12 +309,21 @@ export default function JarvisChat() {
         <View style={styles.headerOrb}>
           <Text style={styles.headerOrbText}>J</Text>
         </View>
-        <View>
+        <View style={{ flex: 1 }}>
           <Text style={styles.headerTitle}>JARVIS</Text>
           <Text style={[styles.headerSub, isOnline && { color: '#00FF88' }]}>
             {isGenerating ? 'Processing...' : isOnline ? modelName + ' Online' : 'Connecting...'}
           </Text>
         </View>
+        <TouchableOpacity
+          style={[styles.voiceToggle, autoRead && styles.voiceToggleOn]}
+          onPress={() => {
+            if (isSpeaking) stopSpeaking();
+            setAutoRead(prev => !prev);
+          }}
+        >
+          <Text style={styles.voiceToggleText}>{autoRead ? '🔊' : '🔇'}</Text>
+        </TouchableOpacity>
       </View>
 
       <ScrollView
@@ -288,6 +354,22 @@ export default function JarvisChat() {
               {isGenerating && !msg.content && msg.role === 'assistant' && (
                 <ActivityIndicator size="small" color="#00D9FF" style={{ marginTop: 4 }} />
               )}
+              {msg.role === 'assistant' && msg.content ? (
+                <TouchableOpacity
+                  style={styles.speakBtn}
+                  onPress={() => {
+                    if (isSpeaking && speakingMsgId === msg.id) {
+                      stopSpeaking();
+                    } else {
+                      speakText(msg.content, msg.id);
+                    }
+                  }}
+                >
+                  <Text style={styles.speakBtnText}>
+                    {isSpeaking && speakingMsgId === msg.id ? '⏹' : '🔊'}
+                  </Text>
+                </TouchableOpacity>
+              ) : null}
             </View>
           </View>
         ))}
@@ -356,6 +438,12 @@ const styles = StyleSheet.create({
   headerOrbText: { fontSize: 22, fontWeight: '700', color: '#00D9FF' },
   headerTitle: { fontSize: 22, fontWeight: '700', color: '#FFF', letterSpacing: 2 },
   headerSub: { fontSize: 12, color: '#00D9FF', marginTop: 2 },
+  voiceToggle: {
+    width: 44, height: 44, borderRadius: 22, backgroundColor: '#1A1A2E',
+    alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#2A2A3A',
+  },
+  voiceToggleOn: { backgroundColor: '#00D9FF20', borderColor: '#00D9FF50' },
+  voiceToggleText: { fontSize: 20 },
   messages: { flex: 1 },
   messagesContent: { padding: 16, paddingBottom: 20 },
   empty: { alignItems: 'center', paddingVertical: 60 },
@@ -368,6 +456,11 @@ const styles = StyleSheet.create({
   userBubble: { backgroundColor: '#7B61FF', borderBottomRightRadius: 6 },
   aiBubble: { backgroundColor: '#14141F', borderBottomLeftRadius: 6, borderWidth: 1, borderColor: '#1E1E2A' },
   msgText: { fontSize: 15, color: '#E0E0E0', lineHeight: 22 },
+  speakBtn: {
+    alignSelf: 'flex-end', marginTop: 6, paddingHorizontal: 8, paddingVertical: 4,
+    borderRadius: 12, backgroundColor: 'rgba(0,217,255,0.1)',
+  },
+  speakBtnText: { fontSize: 16 },
   fileTag: {
     flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.15)',
     borderRadius: 8, paddingHorizontal: 8, paddingVertical: 4, marginBottom: 6, alignSelf: 'flex-start',
