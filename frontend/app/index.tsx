@@ -15,6 +15,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
+import { parseDeviceActions, executeDeviceAction } from '../utils/deviceActions';
 
 const BACKEND_URL = 'https://jarvis-backend-production-a86c.up.railway.app';
 
@@ -100,6 +101,58 @@ export default function JarvisChat() {
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
   };
 
+  // Process device actions from JARVIS response, execute them, and send results back
+  const processDeviceActions = useCallback(async (actions: any[], currentMessages: Message[]) => {
+    for (const action of actions) {
+      try {
+        const result = await executeDeviceAction(action);
+
+        // Add a system message showing the device result
+        const deviceResultMsg: Message = {
+          id: Date.now().toString() + '_device',
+          role: 'assistant',
+          content: `[Device: ${action.action}]\n${result}`,
+        };
+
+        setMessages(prev => [...prev, deviceResultMsg]);
+
+        // Send the result back to JARVIS for a follow-up response
+        const followUpMsg: Message = {
+          id: (Date.now() + 2).toString(),
+          role: 'assistant',
+          content: '',
+        };
+        setMessages(prev => [...prev, followUpMsg]);
+        setIsGenerating(true);
+
+        const history = [
+          ...currentMessages.map(m => ({ role: m.role, content: m.content })),
+          { role: 'user' as const, content: `[Device result for ${action.action}]: ${result}` },
+        ].slice(-20);
+
+        const res = await fetch(`${BACKEND_URL}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: history }),
+        });
+        const data = await res.json();
+
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated.length - 1;
+          if (updated[last]?.role === 'assistant' && !updated[last].content) {
+            updated[last] = { ...updated[last], content: data.content || '' };
+          }
+          return updated;
+        });
+      } catch (err) {
+        console.log('Device action error:', err);
+      } finally {
+        setIsGenerating(false);
+      }
+    }
+  }, []);
+
   const sendMessage = useCallback(async () => {
     if ((!inputText.trim() && !attachedFile) || isGenerating) return;
     Keyboard.dismiss();
@@ -167,7 +220,15 @@ export default function JarvisChat() {
         const updated = [...prev];
         const last = updated.length - 1;
         if (updated[last]?.role === 'assistant') {
-          updated[last] = { ...updated[last], content: data.content || 'Empty response from Jarvis.' };
+          const responseText = data.content || 'Empty response from Jarvis.';
+          // Parse and strip device action blocks from displayed text
+          const { cleanText, actions } = parseDeviceActions(responseText);
+          updated[last] = { ...updated[last], content: cleanText || responseText };
+
+          // Execute device actions in background
+          if (actions.length > 0) {
+            processDeviceActions(actions, [...updated]);
+          }
         }
         return updated;
       });

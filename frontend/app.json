@@ -12,7 +12,11 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.certifiedmalt.jarvis",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSContactsUsageDescription": "Find and manage contacts through Jarvis",
+        "NSCalendarsUsageDescription": "View and manage your schedule through Jarvis",
+        "NSLocationWhenInUseUsageDescription": "Provide location-aware assistance",
+        "NSPhotoLibraryUsageDescription": "Share photos and files with Jarvis"
       }
     },
     "android": {
@@ -20,7 +24,14 @@
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#000000"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "READ_CONTACTS",
+        "READ_CALENDAR",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "READ_EXTERNAL_STORAGE"
+      ]
     },
     "web": {
       "bundler": "metro",
@@ -36,6 +47,24 @@
           "imageWidth": 200,
           "resizeMode": "contain",
           "backgroundColor": "#000000"
+        }
+      ],
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "Jarvis needs contacts to help you find people."
+        }
+      ],
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "Jarvis needs calendar access to manage your schedule."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Jarvis uses your location for context-aware help."
         }
       ]
     ],
