@@ -642,3 +642,4 @@ app.add_middleware(
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
+# v2.2.0 - File upload + Device integrations
