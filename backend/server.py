@@ -14,6 +14,9 @@ from openai import AsyncOpenAI
 from binance.client import Client as BinanceClient
 from binance.exceptions import BinanceAPIException
 import json
+from fastapi import UploadFile, File, Form
+import io
+import PyPDF2
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -361,8 +364,20 @@ async def chat(request: ChatRequest):
         )
 
     except Exception as e:
-        logger.error(f"Chat error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = str(e)
+        logger.error(f"Chat error: {error_msg}")
+        # Return a friendly Jarvis-style error instead of a raw 500
+        if "rate_limit" in error_msg.lower() or "429" in error_msg:
+            detail = "Together.ai rate limit hit. Give me a moment, sir."
+        elif "authentication" in error_msg.lower() or "401" in error_msg:
+            detail = "Together.ai API key issue. Please check your key, sir."
+        elif "timeout" in error_msg.lower():
+            detail = "The LLM is taking too long to respond. Try again, sir."
+        elif "connection" in error_msg.lower():
+            detail = "Cannot reach Together.ai servers right now. Try again shortly, sir."
+        else:
+            detail = f"LLM error: {error_msg}"
+        raise HTTPException(status_code=500, detail=detail)
 
 @api_router.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
@@ -450,6 +465,144 @@ async def binance_trades(symbol: str = None, limit: int = 10):
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
+
+
+# ─── File Upload & Processing ──────────────────────────────────────
+def extract_text_from_file(filename: str, content: bytes) -> str:
+    """Extract text content from various file types."""
+    ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
+
+    try:
+        if ext in ('txt', 'md', 'csv', 'json', 'xml', 'html', 'css', 'js', 'py',
+                    'ts', 'tsx', 'jsx', 'yaml', 'yml', 'ini', 'cfg', 'log', 'sh',
+                    'sql', 'env', 'toml', 'rs', 'go', 'java', 'c', 'cpp', 'h', 'swift'):
+            return content.decode('utf-8', errors='replace')
+        elif ext == 'pdf':
+            reader = PyPDF2.PdfReader(io.BytesIO(content))
+            text_parts = []
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    text_parts.append(text)
+            return '\n'.join(text_parts) if text_parts else '[PDF contained no extractable text]'
+        else:
+            # Try to read as text anyway
+            try:
+                return content.decode('utf-8', errors='replace')
+            except Exception:
+                return f'[Binary file: {filename} — {len(content)} bytes. Cannot extract text.]'
+    except Exception as e:
+        return f'[Error extracting text from {filename}: {str(e)}]'
+
+
+@api_router.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload a file, extract text, store in MongoDB, return file_id and preview."""
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:  # 10MB limit
+        raise HTTPException(status_code=400, detail="File too large. Max 10MB.")
+
+    extracted_text = extract_text_from_file(file.filename or 'unknown', content)
+
+    file_doc = {
+        "id": str(uuid.uuid4()),
+        "filename": file.filename,
+        "content_type": file.content_type,
+        "size": len(content),
+        "extracted_text": extracted_text,
+        "text_length": len(extracted_text),
+        "uploaded_at": datetime.utcnow(),
+    }
+
+    try:
+        await db.files.insert_one(file_doc)
+    except Exception as e:
+        logger.warning(f"Failed to save file metadata: {e}")
+
+    # Truncate preview for response
+    preview = extracted_text[:500] + ('...' if len(extracted_text) > 500 else '')
+
+    return {
+        "file_id": file_doc["id"],
+        "filename": file.filename,
+        "size": len(content),
+        "text_length": len(extracted_text),
+        "preview": preview,
+    }
+
+
+@api_router.post("/chat/with-file")
+async def chat_with_file(
+    messages: str = Form(...),
+    file: UploadFile = File(None),
+    file_id: str = Form(None),
+    temperature: float = Form(0.7),
+    max_tokens: int = Form(2000),
+):
+    """Chat with Jarvis with optional file context."""
+    if not openai_client:
+        raise HTTPException(status_code=500, detail="LLM not configured")
+
+    import json as json_mod
+    try:
+        msg_list = json_mod.loads(messages)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid messages JSON")
+
+    # Get file context
+    file_context = ""
+    filename = ""
+
+    if file:
+        content = await file.read()
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File too large. Max 10MB.")
+        extracted = extract_text_from_file(file.filename or 'unknown', content)
+        filename = file.filename or 'unknown'
+        # Truncate to ~8000 chars to fit in context window
+        file_context = extracted[:8000]
+    elif file_id:
+        file_doc = await db.files.find_one({"id": file_id})
+        if file_doc:
+            file_context = file_doc.get("extracted_text", "")[:8000]
+            filename = file_doc.get("filename", "unknown")
+
+    # Build messages
+    system_content = JARVIS_SYSTEM_PROMPT
+    if file_context:
+        system_content += f"\n\nThe user has shared a file called '{filename}'. Here is its content:\n---\n{file_context}\n---\nUse this content to answer the user's questions."
+
+    chat_messages = [{"role": "system", "content": system_content}]
+    for msg in msg_list:
+        chat_messages.append({"role": msg["role"], "content": msg["content"]})
+
+    try:
+        response = await openai_client.chat.completions.create(
+            model=DEFAULT_MODEL,
+            messages=chat_messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+        content_text = response.choices[0].message.content
+        usage = {
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens,
+            "total_tokens": response.usage.total_tokens,
+        } if response.usage else None
+
+        return {
+            "id": str(uuid.uuid4()),
+            "content": content_text,
+            "model": DEFAULT_MODEL,
+            "usage": usage,
+            "file_used": filename if file_context else None,
+        }
+
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Chat with file error: {error_msg}")
+        raise HTTPException(status_code=500, detail=f"LLM error: {error_msg}")
 
 
 # ─── Legacy Routes ─────────────────────────────────────────────────

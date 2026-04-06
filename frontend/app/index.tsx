@@ -10,15 +10,26 @@ import {
   Platform,
   ActivityIndicator,
   Keyboard,
+  Alert,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system';
 
 const BACKEND_URL = 'https://jarvis-backend-production-a86c.up.railway.app';
+
+type AttachedFile = {
+  name: string;
+  uri: string;
+  mimeType: string;
+  size: number;
+};
 
 type Message = {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  fileName?: string;
 };
 
 export default function JarvisChat() {
@@ -27,6 +38,7 @@ export default function JarvisChat() {
   const [inputText, setInputText] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [isOnline, setIsOnline] = useState(false);
+  const [attachedFile, setAttachedFile] = useState<AttachedFile | null>(null);
   const scrollViewRef = useRef<ScrollView>(null);
 
   const [modelName, setModelName] = useState('Connecting...');
@@ -53,15 +65,58 @@ export default function JarvisChat() {
     }
   }, [messages]);
 
+  const pickFile = useCallback(async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: '*/*',
+        copyToCacheDirectory: true,
+      });
+
+      if (!result.canceled && result.assets && result.assets.length > 0) {
+        const asset = result.assets[0];
+        if (asset.size && asset.size > 10 * 1024 * 1024) {
+          Alert.alert('File too large', 'Maximum file size is 10MB.');
+          return;
+        }
+        setAttachedFile({
+          name: asset.name,
+          uri: asset.uri,
+          mimeType: asset.mimeType || 'application/octet-stream',
+          size: asset.size || 0,
+        });
+      }
+    } catch (err) {
+      console.log('File picker error:', err);
+    }
+  }, []);
+
+  const removeFile = useCallback(() => {
+    setAttachedFile(null);
+  }, []);
+
+  const formatFileSize = (bytes: number): string => {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  };
+
   const sendMessage = useCallback(async () => {
-    if (!inputText.trim() || isGenerating) return;
+    if ((!inputText.trim() && !attachedFile) || isGenerating) return;
     Keyboard.dismiss();
 
-    const userMsg: Message = { id: Date.now().toString(), role: 'user', content: inputText.trim() };
+    const msgContent = inputText.trim() || (attachedFile ? `Analyze this file: ${attachedFile.name}` : '');
+    const userMsg: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: msgContent,
+      fileName: attachedFile?.name,
+    };
     const assistantMsg: Message = { id: (Date.now() + 1).toString(), role: 'assistant', content: '' };
 
+    const currentFile = attachedFile;
     setMessages(prev => [...prev, userMsg, assistantMsg]);
     setInputText('');
+    setAttachedFile(null);
     setIsGenerating(true);
 
     try {
@@ -70,19 +125,49 @@ export default function JarvisChat() {
         .slice(-20)
         .map(m => ({ role: m.role, content: m.content }));
 
-      const res = await fetch(`${BACKEND_URL}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: history }),
-      });
+      let data;
 
-      const data = await res.json();
+      if (currentFile) {
+        // Use multipart form upload for file-attached messages
+        const formData = new FormData();
+        formData.append('messages', JSON.stringify(history));
+
+        // Read file and append
+        const fileInfo = await FileSystem.getInfoAsync(currentFile.uri);
+        if (fileInfo.exists) {
+          formData.append('file', {
+            uri: currentFile.uri,
+            name: currentFile.name,
+            type: currentFile.mimeType,
+          } as any);
+        }
+
+        const res = await fetch(`${BACKEND_URL}/api/chat/with-file`, {
+          method: 'POST',
+          body: formData,
+        });
+        data = await res.json();
+        if (!res.ok) {
+          data = { content: data.detail || 'Error processing file.' };
+        }
+      } else {
+        // Regular chat
+        const res = await fetch(`${BACKEND_URL}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: history }),
+        });
+        data = await res.json();
+        if (!res.ok) {
+          data = { content: data.detail || 'Server error. Try again.' };
+        }
+      }
 
       setMessages(prev => {
         const updated = [...prev];
         const last = updated.length - 1;
         if (updated[last]?.role === 'assistant') {
-          updated[last] = { ...updated[last], content: data.content || 'Error getting response.' };
+          updated[last] = { ...updated[last], content: data.content || 'Empty response from Jarvis.' };
         }
         return updated;
       });
@@ -91,14 +176,14 @@ export default function JarvisChat() {
         const updated = [...prev];
         const last = updated.length - 1;
         if (updated[last]?.role === 'assistant') {
-          updated[last] = { ...updated[last], content: 'Connection error. Please try again.' };
+          updated[last] = { ...updated[last], content: 'Cannot reach Jarvis. Check your connection and try again.' };
         }
         return updated;
       });
     } finally {
       setIsGenerating(false);
     }
-  }, [inputText, isGenerating, messages]);
+  }, [inputText, isGenerating, messages, attachedFile]);
 
   return (
     <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
@@ -130,6 +215,12 @@ export default function JarvisChat() {
         {messages.map(msg => (
           <View key={msg.id} style={[styles.msgRow, msg.role === 'user' && styles.msgRowUser]}>
             <View style={[styles.bubble, msg.role === 'user' ? styles.userBubble : styles.aiBubble]}>
+              {msg.fileName && (
+                <View style={styles.fileTag}>
+                  <Text style={styles.fileTagIcon}>📎</Text>
+                  <Text style={styles.fileTagText} numberOfLines={1}>{msg.fileName}</Text>
+                </View>
+              )}
               <Text style={[styles.msgText, msg.role === 'user' && { color: '#FFF' }]}>
                 {msg.content || (isGenerating ? 'Thinking...' : '')}
               </Text>
@@ -142,29 +233,50 @@ export default function JarvisChat() {
       </ScrollView>
 
       <View style={[styles.inputArea, { paddingBottom: Math.max(insets.bottom, 10) + 8 }]}>
-        <TextInput
-          style={styles.input}
-          placeholder="Message Jarvis..."
-          placeholderTextColor="#555"
-          value={inputText}
-          onChangeText={setInputText}
-          onSubmitEditing={sendMessage}
-          returnKeyType="send"
-          multiline
-          maxLength={4000}
-          editable={!isGenerating}
-        />
-        <TouchableOpacity
-          style={[styles.sendBtn, (!inputText.trim() || isGenerating) && styles.sendBtnOff]}
-          onPress={sendMessage}
-          disabled={!inputText.trim() || isGenerating}
-        >
-          {isGenerating ? (
-            <ActivityIndicator size="small" color="#FFF" />
-          ) : (
-            <Text style={styles.sendIcon}>{'>'}</Text>
-          )}
-        </TouchableOpacity>
+        {attachedFile && (
+          <View style={styles.filePreview}>
+            <Text style={styles.filePreviewIcon}>📎</Text>
+            <View style={styles.filePreviewInfo}>
+              <Text style={styles.filePreviewName} numberOfLines={1}>{attachedFile.name}</Text>
+              <Text style={styles.filePreviewSize}>{formatFileSize(attachedFile.size)}</Text>
+            </View>
+            <TouchableOpacity onPress={removeFile} style={styles.fileRemoveBtn}>
+              <Text style={styles.fileRemoveText}>✕</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+        <View style={styles.inputRow}>
+          <TouchableOpacity
+            style={styles.attachBtn}
+            onPress={pickFile}
+            disabled={isGenerating}
+          >
+            <Text style={[styles.attachIcon, isGenerating && { opacity: 0.3 }]}>+</Text>
+          </TouchableOpacity>
+          <TextInput
+            style={styles.input}
+            placeholder="Message Jarvis..."
+            placeholderTextColor="#555"
+            value={inputText}
+            onChangeText={setInputText}
+            onSubmitEditing={sendMessage}
+            returnKeyType="send"
+            multiline
+            maxLength={4000}
+            editable={!isGenerating}
+          />
+          <TouchableOpacity
+            style={[styles.sendBtn, (!inputText.trim() && !attachedFile || isGenerating) && styles.sendBtnOff]}
+            onPress={sendMessage}
+            disabled={(!inputText.trim() && !attachedFile) || isGenerating}
+          >
+            {isGenerating ? (
+              <ActivityIndicator size="small" color="#FFF" />
+            ) : (
+              <Text style={styles.sendIcon}>{'>'}</Text>
+            )}
+          </TouchableOpacity>
+        </View>
       </View>
     </KeyboardAvoidingView>
   );
@@ -195,18 +307,44 @@ const styles = StyleSheet.create({
   userBubble: { backgroundColor: '#7B61FF', borderBottomRightRadius: 6 },
   aiBubble: { backgroundColor: '#14141F', borderBottomLeftRadius: 6, borderWidth: 1, borderColor: '#1E1E2A' },
   msgText: { fontSize: 15, color: '#E0E0E0', lineHeight: 22 },
+  fileTag: {
+    flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.15)',
+    borderRadius: 8, paddingHorizontal: 8, paddingVertical: 4, marginBottom: 6, alignSelf: 'flex-start',
+  },
+  fileTagIcon: { fontSize: 12, marginRight: 4 },
+  fileTagText: { fontSize: 12, color: '#FFF', maxWidth: 150 },
   inputArea: {
-    paddingHorizontal: 16, paddingTop: 10, backgroundColor: '#0A0A0F',
+    paddingHorizontal: 12, paddingTop: 10, backgroundColor: '#0A0A0F',
     borderTopWidth: 1, borderTopColor: '#1A1A25',
   },
+  filePreview: {
+    flexDirection: 'row', alignItems: 'center', backgroundColor: '#1A1A2E',
+    borderRadius: 12, padding: 10, marginBottom: 8, borderWidth: 1, borderColor: '#00D9FF30',
+  },
+  filePreviewIcon: { fontSize: 20, marginRight: 10 },
+  filePreviewInfo: { flex: 1 },
+  filePreviewName: { fontSize: 14, color: '#FFF', fontWeight: '600' },
+  filePreviewSize: { fontSize: 11, color: '#888', marginTop: 2 },
+  fileRemoveBtn: {
+    width: 28, height: 28, borderRadius: 14, backgroundColor: '#FF4444',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  fileRemoveText: { fontSize: 14, color: '#FFF', fontWeight: '700' },
+  inputRow: {
+    flexDirection: 'row', alignItems: 'flex-end', gap: 8,
+  },
+  attachBtn: {
+    width: 44, height: 44, borderRadius: 22, backgroundColor: '#1A1A2E',
+    alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#2A2A3A',
+  },
+  attachIcon: { fontSize: 24, color: '#00D9FF', fontWeight: '300' },
   input: {
-    backgroundColor: '#12121A', borderRadius: 24, paddingHorizontal: 20,
+    flex: 1, backgroundColor: '#12121A', borderRadius: 24, paddingHorizontal: 20,
     paddingVertical: Platform.OS === 'ios' ? 14 : 10, fontSize: 16,
     color: '#FFF', maxHeight: 120, borderWidth: 1, borderColor: '#1E1E2A',
-    marginBottom: 10,
   },
   sendBtn: {
-    position: 'absolute', right: 24, bottom: 20, width: 44, height: 44,
+    width: 44, height: 44,
     borderRadius: 22, backgroundColor: '#00D9FF', alignItems: 'center', justifyContent: 'center',
   },
   sendBtnOff: { backgroundColor: '#1A1A25' },
