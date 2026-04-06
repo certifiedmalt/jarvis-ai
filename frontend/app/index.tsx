@@ -73,7 +73,8 @@ export default function JarvisChat() {
   // TTS functions
   const speakText = useCallback(async (text: string, msgId: string) => {
     // Stop any current speech
-    await Speech.stop();
+    const speaking = await Speech.isSpeakingAsync();
+    if (speaking) await Speech.stop();
 
     // Clean text - remove code blocks, action blocks, JSON
     const cleanText = text
@@ -81,18 +82,36 @@ export default function JarvisChat() {
       .replace(/\{[\s\S]*?\}/g, '')
       .replace(/\[Device:.*?\]/g, '')
       .replace(/\n+/g, ' ')
+      .replace(/\s+/g, ' ')
       .trim();
 
-    if (!cleanText) return;
+    if (!cleanText || cleanText.length < 2) return;
 
     setIsSpeaking(true);
     setSpeakingMsgId(msgId);
 
-    Speech.speak(cleanText, {
+    // Find best available British voice, fallback to default
+    let voiceId: string | undefined;
+    try {
+      const voices = await Speech.getAvailableVoicesAsync();
+      const britishVoice = voices.find(v =>
+        v.language === 'en-GB' && v.quality === 'Enhanced'
+      ) || voices.find(v =>
+        v.language === 'en-GB'
+      ) || voices.find(v =>
+        v.language.startsWith('en')
+      );
+      if (britishVoice) {
+        voiceId = britishVoice.identifier;
+      }
+    } catch (e) {
+      // Fall back to language-only
+    }
+
+    const options: Speech.SpeechOptions = {
       language: 'en-GB',
       pitch: 0.95,
       rate: Platform.OS === 'ios' ? 0.52 : 0.9,
-      voice: Platform.OS === 'ios' ? 'com.apple.speech.synthesis.voice.Daniel' : undefined,
       onDone: () => {
         setIsSpeaking(false);
         setSpeakingMsgId(null);
@@ -101,11 +120,18 @@ export default function JarvisChat() {
         setIsSpeaking(false);
         setSpeakingMsgId(null);
       },
-      onError: () => {
+      onError: (error) => {
+        console.log('Speech error:', error);
         setIsSpeaking(false);
         setSpeakingMsgId(null);
       },
-    });
+    };
+
+    if (voiceId) {
+      options.voice = voiceId;
+    }
+
+    Speech.speak(cleanText, options);
   }, []);
 
   const stopSpeaking = useCallback(async () => {
