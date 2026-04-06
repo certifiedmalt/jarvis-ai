@@ -83,3 +83,4 @@ android-sdk/frontend/node_modules/@react-native-ai/mlc/prebuilt/android/lib/mlc4
 frontend/node_modules/@react-native-ai/mlc/prebuilt/android/lib/mlc4j/output/arm64-v8a/libtvm4j_runtime_packed.so
 backend/.env
 frontend/.metro-cache/
+frontend/.metro-cache/
