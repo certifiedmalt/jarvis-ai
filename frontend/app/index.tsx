@@ -25,6 +25,7 @@ import { Audio } from 'expo-av';
 const ELEVENLABS_API_KEY = 'sk_8dd9778f172097e391decb1b8ce43845d40fcbdcbf9cb57d';
 const ELEVENLABS_VOICE_ID = 'WgsC88oU7oxSBORk8LGd'; // User's custom Jarvis 1 voice
 import { parseDeviceActions, executeDeviceAction } from '../utils/deviceActions';
+import { parseSelfUpdateActions, executeSelfUpdate } from '../utils/selfUpdate';
 
 const BACKEND_URL = 'https://jarvis-backend-production-a86c.up.railway.app';
 
@@ -351,7 +352,58 @@ export default function JarvisChat() {
     setAttachedFile(null);
   }, []);
 
-  const formatFileSize = (bytes: number): string => {
+  // Process self-update actions from JARVIS response
+  const processSelfUpdateActions = useCallback(async (actions: any[], currentMessages: Message[]) => {
+    for (const action of actions) {
+      try {
+        const result = await executeSelfUpdate(action);
+
+        const updateResultMsg: Message = {
+          id: Date.now().toString() + '_update',
+          role: 'assistant',
+          content: `[Self-Update: ${action.action}]\n${result}`,
+        };
+        setMessages(prev => [...prev, updateResultMsg]);
+
+        // If it was a read or list, send results back to JARVIS
+        if (action.action === 'read' || action.action === 'list') {
+          const followUpMsg: Message = { id: (Date.now() + 2).toString(), role: 'assistant', content: '' };
+          setMessages(prev => [...prev, followUpMsg]);
+          setIsGenerating(true);
+
+          const history = [
+            ...currentMessages.map(m => ({ role: m.role, content: m.content })),
+            { role: 'user' as const, content: `[Code result for ${action.action}]: ${result}` },
+          ].slice(-20);
+
+          const res = await fetch(`${BACKEND_URL}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages: history }),
+          });
+          const data = await res.json();
+
+          setMessages(prev => {
+            const updated = [...prev];
+            const last = updated.length - 1;
+            if (updated[last]?.role === 'assistant' && !updated[last].content) {
+              const { cleanText: noDevice } = parseDeviceActions(data.content || '');
+              const { cleanText: finalText, actions: moreUpdates } = parseSelfUpdateActions(noDevice);
+              updated[last] = { ...updated[last], content: finalText };
+              if (moreUpdates.length > 0) {
+                processSelfUpdateActions(moreUpdates, [...updated]);
+              }
+            }
+            return updated;
+          });
+        }
+      } catch (err) {
+        console.log('Self-update error:', err);
+      } finally {
+        setIsGenerating(false);
+      }
+    }
+  }, []);
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
@@ -408,6 +460,12 @@ export default function JarvisChat() {
       }
     }
   }, []);
+
+  const formatFileSize = (bytes: number): string => {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  };
 
   const sendMessage = useCallback(async () => {
     if ((!inputText.trim() && !attachedFile) || isGenerating) return;
@@ -478,12 +536,17 @@ export default function JarvisChat() {
         if (updated[last]?.role === 'assistant') {
           const responseText = data.content || 'Empty response from Jarvis.';
           // Parse and strip device action blocks from displayed text
-          const { cleanText, actions } = parseDeviceActions(responseText);
-          updated[last] = { ...updated[last], content: cleanText || responseText };
+          const { cleanText: noDevice, actions: deviceActions } = parseDeviceActions(responseText);
+          const { cleanText: finalText, actions: selfUpdateActions } = parseSelfUpdateActions(noDevice);
+          updated[last] = { ...updated[last], content: finalText || responseText };
 
           // Execute device actions in background
-          if (actions.length > 0) {
-            processDeviceActions(actions, [...updated]);
+          if (deviceActions.length > 0) {
+            processDeviceActions(deviceActions, [...updated]);
+          }
+          // Execute self-update actions in background
+          if (selfUpdateActions.length > 0) {
+            processSelfUpdateActions(selfUpdateActions, [...updated]);
           }
         }
         return updated;

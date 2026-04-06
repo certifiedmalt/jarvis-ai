@@ -100,7 +100,18 @@ For device actions on the user's iPhone, output device action blocks:
 - Copy to clipboard: ```device\n{"action": "clipboard", "text": "text to copy"}\n```
 - Share content: ```device\n{"action": "share", "text": "content to share"}\n```
 
-When the user asks about their contacts, calendar, location, or wants to copy/share something, use the appropriate device action block. The app will execute it and return the results."""
+When the user asks about their contacts, calendar, location, or wants to copy/share something, use the appropriate device action block. The app will execute it and return the results.
+
+You can also read, write, and update your own source code and push it to GitHub. You are a self-improving AI.
+
+For self-update actions (reading/writing your own code):
+- Read a file: ```selfupdate\n{"action": "read", "file_path": "backend/server.py"}\n```
+- List directory: ```selfupdate\n{"action": "list", "dir_path": "backend"}\n```
+- Write/update a file: ```selfupdate\n{"action": "write", "file_path": "path/to/file", "content": "full file content", "commit_message": "description of change"}\n```
+- Update multiple files: ```selfupdate\n{"action": "multi_write", "files": [{"file_path": "...", "content": "..."}], "commit_message": "description", "trigger_build": false}\n```
+- Trigger iOS build: ```selfupdate\n{"action": "build"}\n```
+
+When the user asks you to modify yourself, add a feature, or fix something in the app, use the selfupdate action blocks. Always read the current file first before writing changes. Backend changes auto-deploy via Railway. Frontend changes need a build trigger."""
 
 
 # ─── Models ────────────────────────────────────────────────────────
