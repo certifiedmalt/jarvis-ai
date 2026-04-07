@@ -472,6 +472,94 @@ async def chat_stream(request: ChatRequest):
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
+# ─── Deploy Pipeline (GitHub Actions) ──────────────────────────────
+GITHUB_PAT = os.getenv("GITHUB_PAT", "")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "certifiedmalt/jarvis-ai")
+
+@api_router.post("/deploy/build")
+async def deploy_build(action: str = "build_and_submit"):
+    """Trigger iOS build + TestFlight submit via GitHub Actions."""
+    if not GITHUB_PAT:
+        raise HTTPException(status_code=500, detail="GitHub PAT not configured on server.")
+
+    valid_actions = ["build", "submit", "build_and_submit"]
+    if action not in valid_actions:
+        action = "build_and_submit"
+
+    try:
+        async with httpx.AsyncClient() as client:
+            # Trigger the workflow
+            r = await client.post(
+                f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/build-ios.yml/dispatches",
+                headers={
+                    "Authorization": f"token {GITHUB_PAT}",
+                    "Accept": "application/vnd.github.v3+json",
+                },
+                json={"ref": "main", "inputs": {"action": action}},
+            )
+
+            if r.status_code == 204:
+                # Save deploy record
+                deploy_id = str(uuid.uuid4())
+                await db.deploys.insert_one({
+                    "_id": deploy_id,
+                    "action": action,
+                    "status": "triggered",
+                    "triggered_at": datetime.utcnow().isoformat(),
+                })
+                return {
+                    "status": "triggered",
+                    "deploy_id": deploy_id,
+                    "action": action,
+                    "message": f"iOS {action} workflow triggered. Check status with /api/deploy/status.",
+                }
+            else:
+                logger.error(f"GitHub Actions trigger failed: {r.status_code} {r.text}")
+                raise HTTPException(
+                    status_code=r.status_code,
+                    detail=f"Failed to trigger workflow: {r.text}",
+                )
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=500, detail=f"GitHub API error: {str(e)}")
+
+@api_router.get("/deploy/status")
+async def deploy_status():
+    """Check the latest GitHub Actions workflow run status."""
+    if not GITHUB_PAT:
+        raise HTTPException(status_code=500, detail="GitHub PAT not configured.")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/build-ios.yml/runs?per_page=1",
+                headers={
+                    "Authorization": f"token {GITHUB_PAT}",
+                    "Accept": "application/vnd.github.v3+json",
+                },
+            )
+
+            if r.status_code != 200:
+                raise HTTPException(status_code=r.status_code, detail="Failed to fetch workflow runs.")
+
+            data = r.json()
+            runs = data.get("workflow_runs", [])
+
+            if not runs:
+                return {"status": "no_runs", "message": "No build workflows have been run yet."}
+
+            latest = runs[0]
+            return {
+                "status": latest["status"],
+                "conclusion": latest.get("conclusion"),
+                "run_id": latest["id"],
+                "run_url": latest["html_url"],
+                "created_at": latest["created_at"],
+                "updated_at": latest["updated_at"],
+            }
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=500, detail=f"GitHub API error: {str(e)}")
+
+
 # ─── File Upload & Processing ──────────────────────────────────────
 def extract_text_from_file(filename: str, content: bytes) -> str:
     """Extract text content from various file types."""

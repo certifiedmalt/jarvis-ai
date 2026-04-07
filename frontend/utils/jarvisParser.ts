@@ -94,11 +94,34 @@ async function executeCodeHandler(name: string, args: Record<string, any>): Prom
   return await executeSelfUpdate(updateAction);
 }
 
-// ── Deploy Handler ─────────────────────────────────────────────────
+// ── Deploy Handler (Server-side via GitHub Actions) ────────────────
 
 async function executeDeployHandler(name: string): Promise<string> {
-  if (name === 'triggerIOSBuild' || name === 'submitToTestFlight') {
-    return await executeSelfUpdate({ action: 'build' });
+  const BACKEND = 'https://jarvis-backend-production-a86c.up.railway.app';
+
+  try {
+    if (name === 'triggerIOSBuild') {
+      const res = await fetch(`${BACKEND}/api/deploy/build?action=build_and_submit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json();
+      if (!res.ok) return `Deploy error: ${data.detail || 'Unknown error'}`;
+      return `Build triggered! ${data.message || ''} Deploy ID: ${data.deploy_id || 'N/A'}`;
+    }
+
+    if (name === 'submitToTestFlight') {
+      const res = await fetch(`${BACKEND}/api/deploy/build?action=submit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json();
+      if (!res.ok) return `Submit error: ${data.detail || 'Unknown error'}`;
+      return `TestFlight submission triggered! ${data.message || ''}`;
+    }
+
+    return `Unknown Deploy function: ${name}`;
+  } catch (err: any) {
+    return `Deploy request failed: ${err.message || String(err)}`;
   }
-  return `Unknown Deploy function: ${name}`;
 }

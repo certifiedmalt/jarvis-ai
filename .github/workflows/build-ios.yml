@@ -1,0 +1,50 @@
+name: Build & Deploy iOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'build'
+        type: choice
+        options:
+          - build
+          - submit
+          - build_and_submit
+
+jobs:
+  ios-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install EAS CLI
+        run: npm install -g eas-cli
+
+      - name: Setup Expo authentication
+        run: |
+          mkdir -p ~/.expo
+          echo '${{ secrets.EXPO_STATE }}' > ~/.expo/state.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: Run EAS Build (iOS)
+        if: ${{ github.event.inputs.action == 'build' || github.event.inputs.action == 'build_and_submit' }}
+        working-directory: frontend
+        run: eas build --platform ios --profile production --non-interactive
+
+      - name: Submit to TestFlight
+        if: ${{ github.event.inputs.action == 'submit' || github.event.inputs.action == 'build_and_submit' }}
+        working-directory: frontend
+        run: eas submit --platform ios --latest --non-interactive
