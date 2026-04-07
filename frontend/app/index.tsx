@@ -385,11 +385,25 @@ export default function JarvisChat() {
     loadConversation();
   }, []);
 
-  // Unified tool action processor — handles device, code, deploy, and voice actions
+  // Unified tool action processor with depth limit to prevent infinite loops
   const processToolAction = useCallback(async (
     toolCall: ToolCall,
     currentMessages: Message[],
+    depth: number = 0,
   ) => {
+    const MAX_TOOL_DEPTH = 3;
+    if (depth >= MAX_TOOL_DEPTH) {
+      setMessages(prev => {
+        const updated = [...prev];
+        const last = updated.length - 1;
+        if (updated[last]?.role === 'assistant') {
+          updated[last] = { ...updated[last], content: 'Tool chain limit reached. What would you like me to do next?' };
+        }
+        return updated;
+      });
+      setIsGenerating(false);
+      return;
+    }
     try {
       // Execute the tool
       const { result, category, displayName } = await executeToolAction(toolCall);
@@ -446,7 +460,7 @@ export default function JarvisChat() {
           }
           return updated;
         });
-        processToolAction(data.tool_call as ToolCall, chainMsgs);
+        processToolAction(data.tool_call as ToolCall, chainMsgs, depth + 1);
       } else {
         // Normal text follow-up
         const followUpText = data.content || '';
@@ -539,7 +553,7 @@ export default function JarvisChat() {
       }
 
       // Save user message to persistent memory
-      await saveMessage('user', trimmedText);
+      await saveMessage('user', msgContent);
 
       // Parse the response — check for native tool_call field
       if (data.tool_call) {
@@ -569,7 +583,8 @@ export default function JarvisChat() {
         // Save assistant response to persistent memory
         await saveMessage('assistant', responseText);
       }
-    } catch (err) {
+    } catch (err: any) {
+      console.log('Chat error:', err?.message || String(err));
       setMessages(prev => {
         const updated = [...prev];
         const last = updated.length - 1;
