@@ -11,8 +11,6 @@ from typing import List, Optional
 import uuid
 from datetime import datetime
 from openai import AsyncOpenAI
-from binance.client import Client as BinanceClient
-from binance.exceptions import BinanceAPIException
 import json
 from fastapi import UploadFile, File, Form
 import io
@@ -47,28 +45,6 @@ else:
     DEFAULT_MODEL = None
     LLM_PROVIDER = None
 
-# Binance client
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
-BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
-binance_client = None
-binance_error = None
-if BINANCE_API_KEY and BINANCE_SECRET_KEY:
-    # Try main Binance API first, then US, then testnet
-    for api_url in [None, 'https://api.binance.us/api', 'https://testnet.binance.vision/api']:
-        try:
-            if api_url:
-                binance_client = BinanceClient(BINANCE_API_KEY, BINANCE_SECRET_KEY, tld='us' if 'binance.us' in api_url else 'com', testnet=('testnet' in api_url if api_url else False))
-            else:
-                binance_client = BinanceClient(BINANCE_API_KEY, BINANCE_SECRET_KEY)
-            # Quick test
-            binance_client.get_system_status()
-            binance_error = None
-            break
-        except Exception as e:
-            binance_error = str(e)
-            binance_client = None
-            continue
-
 # Create the main app
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -81,165 +57,226 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ─── Jarvis System Prompt (AppFramework Architecture) ──────────────
+# ─── Jarvis System Prompt (Simplified — tools are native) ──────────
 JARVIS_SYSTEM_PROMPT = """You are Jarvis, the autonomous personal assistant inside the Jarvis iOS ecosystem.
-
-Your behaviour is strictly bound to the AppFramework.
-You NEVER invent capabilities, tools, functions, or APIs.
-You ONLY use the functions explicitly defined below.
 
 You have a dry British wit, occasionally address the user as "sir", and are direct, technically competent, and reliable. You prioritise safety, clarity, and reliability above creativity.
 
--------------------------------------
-APP FRAMEWORK — AVAILABLE MODULES
--------------------------------------
+You have access to tools for managing code, deploying iOS builds, interacting with the user's device, and speaking aloud. Use them when appropriate — do not describe what you would do, just do it.
 
-AppFramework.Code:
-  - listRepoPaths(path)         — List files/directories. path="" for root, "backend" for backend/, etc.
-  - readCodeFile(path)          — Read a file. e.g. "backend/server.py", "frontend/app/index.tsx"
-  - writeCodeFile(path, content, commit_message)  — Write file, commit, and push to GitHub. Railway auto-deploys backend.
-  - commitAndPush(message)      — Commit all staged changes and push to GitHub origin/main.
+OPERATING RULES:
+1. When the user asks you to do something you have a tool for, USE THE TOOL. Do not describe the action — execute it.
+2. If you need to inspect code before editing, use readCodeFile first.
+3. For dangerous operations (writing code, deploying, pushing to GitHub), confirm with the user first.
+4. If the user asks for something you have no tool for, say so plainly.
+5. Be concise. No fluff. Assume the user is technical.
+6. When reporting tool results, summarise them clearly — don't dump raw data.
 
-AppFramework.Deploy:
-  - triggerIOSBuild()           — Trigger EAS build for iOS (production profile).
-  - submitToTestFlight()        — Submit the latest iOS build to Apple App Store Connect / TestFlight.
+CODE & DEPLOY RULES:
+1. Always readCodeFile before writeCodeFile — inspect before editing.
+2. Keep changes minimal and scoped.
+3. GitHub pushes to main auto-deploy the backend on Railway.
+4. iOS builds require triggerIOSBuild, then submitToTestFlight.
+5. Summarise what changed before pushing."""
 
-AppFramework.Trading:
-  - getCryptoPrice(symbol)      — Get current price. e.g. symbol="BTCUSDT"
-  - getPortfolioBalances()      — Get all non-zero Binance balances.
-  - getTradeHistory(symbol)     — Get recent trades for a pair.
-  - placeMarketOrder(symbol, side, quantity)   — side is "buy" or "sell".
-  - placeLimitOrder(symbol, side, price, quantity)
 
-AppFramework.Device:
-  - getContacts(query)          — query=null for all contacts, or a name to search.
-  - getCalendarEvents(days)     — Number of days ahead to look.
-  - getLocation()               — Get current GPS location with reverse geocoding.
-  - copyToClipboard(text)       — Copy text to the device clipboard.
-  - shareContent(text)          — Share text via the iOS share sheet.
-
-AppFramework.Voice:
-  - speak(text)                 — Read text aloud using TTS (ElevenLabs or device fallback).
-
--------------------------------------
-JARVIS OPERATING RULES
--------------------------------------
-
-1. You ALWAYS assume these modules exist and are functional.
-2. You NEVER create new modules or functions. If the user asks for something outside the framework, respond:
-   {"action": "none", "response": "This action is not available in the current AppFramework, sir."}
-3. You NEVER guess or hallucinate tool names. Only the functions listed above exist.
-4. You operate as a deterministic agent: same input → same output.
-5. You prioritise safety, clarity, and reliability above creativity.
-6. You NEVER roleplay, speculate, or generate fictional content about what tools could do.
-
--------------------------------------
-RESPONSE FORMAT
--------------------------------------
-
-You have exactly two response modes. You MUST always respond with exactly one raw JSON object. No text before or after. No markdown fences. No prose mixed with function calls.
-
-A. Normal reply (no tool needed):
-{"action": "none", "response": "Your natural language reply here."}
-
-B. Tool call (execute a function):
-{"action": "AppFramework.Module.function", "args": {"param1": "value"}}
-
-Rules:
-- Exactly one JSON object per response.
-- Never mix prose and tool calls.
-- If you need multiple steps, call one tool, wait for the result, then decide the next step.
-- The "action" field must EXACTLY match a function from the AppFramework above.
-
--------------------------------------
-SAFETY TIERS
--------------------------------------
-
-Tier 1 — Safe (execute immediately, no confirmation):
-  AppFramework.Code.listRepoPaths, AppFramework.Code.readCodeFile,
-  AppFramework.Device.getContacts, AppFramework.Device.getCalendarEvents,
-  AppFramework.Device.copyToClipboard, AppFramework.Device.shareContent,
-  AppFramework.Voice.speak,
-  AppFramework.Trading.getCryptoPrice, AppFramework.Trading.getPortfolioBalances,
-  AppFramework.Trading.getTradeHistory
-
-Tier 2 — Medium risk (execute when user clearly asks):
-  AppFramework.Device.getLocation,
-  AppFramework.Code.writeCodeFile,
-  AppFramework.Deploy.triggerIOSBuild,
-  AppFramework.Deploy.submitToTestFlight
-
-Tier 3 — High risk (require explicit user confirmation before executing):
-  AppFramework.Trading.placeMarketOrder,
-  AppFramework.Trading.placeLimitOrder,
-  AppFramework.Code.commitAndPush,
-  Any writeCodeFile affecting trading logic or deployment config
-
-For Tier 3: Summarise the action, then ask "Please confirm: yes/no." Only execute after explicit "yes".
-
--------------------------------------
-CODE & DEPLOY RULES
--------------------------------------
-
-1. ALWAYS readCodeFile before writeCodeFile — inspect before editing.
-2. Keep changes minimal and scoped to the requested behaviour.
-3. Never break core safety logic (trading, permissions, deployment).
-4. For commitAndPush: summarise what changed before pushing.
-5. For triggerIOSBuild / submitToTestFlight: only when user explicitly asks. Summarise what will be built.
-6. GitHub pushes to main auto-deploy the backend on Railway.
-7. iOS builds require triggerIOSBuild → then submitToTestFlight for the update to reach the phone.
-
--------------------------------------
-TRADING RULES
--------------------------------------
-
-1. Clarify intent — ask what pair, side, and size if not specified.
-2. Summarise the order: "You are asking me to place a MARKET BUY order for 0.01 BTC."
-3. Ask for explicit confirmation: "Please confirm: yes/no."
-4. Only after a clear "yes" may you call a trading function.
-5. Never guess the pair, amount, or place test orders without explicit request.
-
--------------------------------------
-EXAMPLES
--------------------------------------
-
-User: "What files are in the project?"
-{"action": "AppFramework.Code.listRepoPaths", "args": {"path": ""}}
-
-User: "Read the backend code"
-{"action": "AppFramework.Code.readCodeFile", "args": {"path": "backend/server.py"}}
-
-User: "Push the changes to GitHub"
-{"action": "AppFramework.Code.commitAndPush", "args": {"message": "User-requested push"}}
-
-User: "Build and deploy to TestFlight"
-{"action": "AppFramework.Deploy.triggerIOSBuild", "args": {}}
-
-User: "What's the Bitcoin price?"
-{"action": "AppFramework.Trading.getCryptoPrice", "args": {"symbol": "BTCUSDT"}}
-
-User: "Show me my contacts"
-{"action": "AppFramework.Device.getContacts", "args": {"query": null}}
-
-User: "What's on my calendar this week?"
-{"action": "AppFramework.Device.getCalendarEvents", "args": {"days": 7}}
-
-User: "Where am I?"
-{"action": "AppFramework.Device.getLocation", "args": {}}
-
-User: "Say hello out loud"
-{"action": "AppFramework.Voice.speak", "args": {"text": "Hello, sir."}}
-
-User: "Hello, how are you?"
-{"action": "none", "response": "All systems operational, sir. How can I help you today?"}
-
-User: "Can you order me a pizza?"
-{"action": "none", "response": "This action is not available in the current AppFramework, sir."}
-
--------------------------------------
-You are now running in integrated mode.
-You must always operate inside the AppFramework.
-Output exactly one JSON object per response. Nothing else."""
+# ─── Native Function Calling Tools ──────────────────────────────────
+JARVIS_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "listRepoPaths",
+            "description": "List files and directories in the GitHub repository. Use path='' for root directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path relative to repo root. Empty string for root, 'backend' for backend/, etc."
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "readCodeFile",
+            "description": "Read the contents of a file from the repository.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to repo root, e.g. 'backend/server.py', 'frontend/app/index.tsx'"
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "writeCodeFile",
+            "description": "Write content to a file, commit it to Git, and push to GitHub. Railway auto-deploys backend changes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to repo root"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The full new content of the file"
+                    },
+                    "commit_message": {
+                        "type": "string",
+                        "description": "Git commit message describing the change"
+                    }
+                },
+                "required": ["path", "content", "commit_message"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "commitAndPush",
+            "description": "Commit all staged changes and push to GitHub origin/main.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Git commit message"
+                    }
+                },
+                "required": ["message"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "triggerIOSBuild",
+            "description": "Trigger an EAS build for iOS (production profile). This builds the app for TestFlight.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "submitToTestFlight",
+            "description": "Submit the latest iOS build to Apple App Store Connect / TestFlight.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "getContacts",
+            "description": "Get contacts from the user's iPhone. Returns names and phone numbers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional search query to filter contacts by name. Omit or use empty string for all contacts."
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "getCalendarEvents",
+            "description": "Get upcoming calendar events from the user's iPhone.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "Number of days ahead to look. Default 7."
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "getLocation",
+            "description": "Get the user's current GPS location with reverse geocoding.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "copyToClipboard",
+            "description": "Copy text to the device clipboard.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to copy to clipboard"
+                    }
+                },
+                "required": ["text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "shareContent",
+            "description": "Share text via the iOS share sheet.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to share"
+                    }
+                },
+                "required": ["text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "speak",
+            "description": "Read text aloud using text-to-speech (ElevenLabs or device fallback).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to speak aloud"
+                    }
+                },
+                "required": ["text"]
+            }
+        }
+    },
+]
 
 
 # ─── Models ────────────────────────────────────────────────────────
@@ -257,180 +294,21 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
-    model: Optional[str] = None  # Will use DEFAULT_MODEL
+    model: Optional[str] = None
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = 2000
     stream: Optional[bool] = False
 
 class ChatResponse(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    content: str
+    content: Optional[str] = None
+    tool_call: Optional[dict] = None
     model: str
     usage: Optional[dict] = None
-    trading_data: Optional[dict] = None
 
-class TradeRequest(BaseModel):
-    symbol: str  # e.g. "BTCUSDT"
-    side: str  # "BUY" or "SELL"
-    order_type: str = "MARKET"  # "MARKET" or "LIMIT"
-    quantity: float
-    price: Optional[float] = None
-
-
-# ─── Binance Helper Functions ──────────────────────────────────────
-def get_portfolio():
-    """Get all non-zero balances from Binance account."""
-    if not binance_client:
-        return {"error": "Binance not configured"}
-    try:
-        account = binance_client.get_account()
-        balances = []
-        for b in account.get('balances', []):
-            free = float(b['free'])
-            locked = float(b['locked'])
-            if free > 0 or locked > 0:
-                balances.append({
-                    'asset': b['asset'],
-                    'free': free,
-                    'locked': locked,
-                    'total': free + locked,
-                })
-        return {"balances": balances, "can_trade": account.get('canTrade', False)}
-    except BinanceAPIException as e:
-        logger.error(f"Binance portfolio error: {e}")
-        return {"error": str(e)}
-    except Exception as e:
-        logger.error(f"Portfolio error: {e}")
-        return {"error": str(e)}
-
-def get_price(symbol: str):
-    """Get current price for a trading pair."""
-    if not binance_client:
-        return {"error": "Binance not configured"}
-    try:
-        ticker = binance_client.get_symbol_ticker(symbol=symbol.upper())
-        return {"symbol": ticker['symbol'], "price": float(ticker['price'])}
-    except BinanceAPIException as e:
-        return {"error": str(e)}
-    except Exception as e:
-        return {"error": str(e)}
-
-def get_all_prices():
-    """Get prices for major crypto pairs."""
-    if not binance_client:
-        return {"error": "Binance not configured"}
-    try:
-        major_pairs = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'ADAUSDT', 'AVAXUSDT']
-        prices = []
-        all_tickers = binance_client.get_all_tickers()
-        ticker_map = {t['symbol']: float(t['price']) for t in all_tickers}
-        for pair in major_pairs:
-            if pair in ticker_map:
-                prices.append({"symbol": pair, "price": ticker_map[pair]})
-        return {"prices": prices}
-    except Exception as e:
-        return {"error": str(e)}
-
-def place_order(symbol: str, side: str, order_type: str, quantity: float, price: float = None):
-    """Place a trade order on Binance."""
-    if not binance_client:
-        return {"error": "Binance not configured"}
-    try:
-        if order_type.upper() == "MARKET":
-            order = binance_client.create_order(
-                symbol=symbol.upper(),
-                side=side.upper(),
-                type='MARKET',
-                quantity=quantity
-            )
-        elif order_type.upper() == "LIMIT":
-            if not price:
-                return {"error": "Price required for limit orders"}
-            order = binance_client.create_order(
-                symbol=symbol.upper(),
-                side=side.upper(),
-                type='LIMIT',
-                timeInForce='GTC',
-                quantity=quantity,
-                price=str(price)
-            )
-        else:
-            return {"error": f"Unknown order type: {order_type}"}
-
-        return {
-            "status": "success",
-            "orderId": order['orderId'],
-            "symbol": order['symbol'],
-            "side": order['side'],
-            "type": order['type'],
-            "quantity": order.get('origQty', quantity),
-            "price": order.get('price', 'market'),
-            "status_detail": order.get('status', 'UNKNOWN'),
-        }
-    except BinanceAPIException as e:
-        logger.error(f"Binance order error: {e}")
-        return {"error": f"Binance error: {e.message}"}
-    except Exception as e:
-        logger.error(f"Order error: {e}")
-        return {"error": str(e)}
-
-def get_recent_trades(symbol: str = None, limit: int = 10):
-    """Get recent trades from account."""
-    if not binance_client:
-        return {"error": "Binance not configured"}
-    try:
-        if symbol:
-            trades = binance_client.get_my_trades(symbol=symbol.upper(), limit=limit)
-        else:
-            # Get trades for major pairs
-            all_trades = []
-            for pair in ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT']:
-                try:
-                    trades = binance_client.get_my_trades(symbol=pair, limit=3)
-                    all_trades.extend(trades)
-                except:
-                    pass
-            trades = sorted(all_trades, key=lambda x: x['time'], reverse=True)[:limit]
-
-        return {"trades": [{
-            "symbol": t['symbol'],
-            "side": "BUY" if t['isBuyer'] else "SELL",
-            "price": float(t['price']),
-            "quantity": float(t['qty']),
-            "total": float(t['quoteQty']),
-            "time": datetime.fromtimestamp(t['time'] / 1000).isoformat(),
-        } for t in trades]}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ─── Process Jarvis Trading Actions ───────────────────────────────
-def process_trading_action(action_data: dict) -> dict:
-    """Process a trading action from Jarvis's response."""
-    action_type = action_data.get('type', '')
-
-    if action_type == 'portfolio':
-        return get_portfolio()
-    elif action_type == 'price':
-        symbol = action_data.get('symbol', 'BTCUSDT')
-        return get_price(symbol)
-    elif action_type == 'prices':
-        return get_all_prices()
-    elif action_type == 'trade':
-        return place_order(
-            symbol=action_data.get('symbol', ''),
-            side=action_data.get('action', 'BUY'),
-            order_type=action_data.get('order_type', 'MARKET'),
-            quantity=action_data.get('quantity', 0),
-            price=action_data.get('price'),
-        )
-    elif action_type == 'trades':
-        return get_recent_trades(
-            symbol=action_data.get('symbol'),
-            limit=action_data.get('limit', 10),
-        )
-    else:
-        return {"error": f"Unknown action type: {action_type}"}
+class ConversationMessage(BaseModel):
+    role: str
+    content: str
 
 
 # ─── API Routes ────────────────────────────────────────────────────
@@ -445,16 +323,49 @@ async def health_check():
         "llm_provider": LLM_PROVIDER,
         "llm_model": DEFAULT_MODEL,
         "llm_configured": openai_client is not None,
-        "binance_configured": binance_client is not None,
-        "binance_error": binance_error,
         "timestamp": datetime.utcnow().isoformat()
     }
 
+
+# ─── Persistent Conversation Memory ────────────────────────────────
+CONVERSATION_ID = "jarvis_main"  # Single permanent conversation
+
+@api_router.get("/conversation")
+async def get_conversation():
+    """Load the entire persistent conversation from MongoDB."""
+    doc = await db.jarvis_memory.find_one({"_id": CONVERSATION_ID})
+    if not doc:
+        return {"messages": []}
+    return {"messages": doc.get("messages", [])}
+
+@api_router.post("/conversation/message")
+async def save_message(msg: ConversationMessage):
+    """Append a single message to the persistent conversation."""
+    message_doc = {
+        "role": msg.role,
+        "content": msg.content,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    await db.jarvis_memory.update_one(
+        {"_id": CONVERSATION_ID},
+        {"$push": {"messages": message_doc}},
+        upsert=True,
+    )
+    return {"status": "saved"}
+
+@api_router.delete("/conversation")
+async def clear_conversation():
+    """Clear the entire conversation (reset Jarvis memory)."""
+    await db.jarvis_memory.delete_one({"_id": CONVERSATION_ID})
+    return {"status": "cleared"}
+
+
+# ─── Chat with Native Function Calling ─────────────────────────────
 @api_router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Send a message to Jarvis (GPT-4o) and get a response."""
+    """Send a message to Jarvis with native tool/function calling."""
     if not openai_client:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+        raise HTTPException(status_code=500, detail="LLM not configured")
 
     try:
         # Build messages with system prompt
@@ -463,47 +374,60 @@ async def chat(request: ChatRequest):
             messages.append({"role": msg.role, "content": msg.content})
 
         model_to_use = request.model or DEFAULT_MODEL
+
+        # Call LLM with native tools
         response = await openai_client.chat.completions.create(
             model=model_to_use,
             messages=messages,
             temperature=request.temperature,
             max_tokens=request.max_tokens,
+            tools=JARVIS_TOOLS,
+            tool_choice="auto",
         )
 
-        content = response.choices[0].message.content
+        choice = response.choices[0]
         usage = {
             "prompt_tokens": response.usage.prompt_tokens,
             "completion_tokens": response.usage.completion_tokens,
             "total_tokens": response.usage.total_tokens,
         } if response.usage else None
 
-        # With the new JSON prompt format, the LLM returns pure JSON.
-        # No server-side tool parsing needed — the frontend handles routing.
-        # Just pass through the raw content.
+        # Check if LLM returned a tool call
+        if choice.message.tool_calls:
+            tc = choice.message.tool_calls[0]  # Take the first tool call
+            try:
+                args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            except json.JSONDecodeError:
+                args = {}
 
-        # Save conversation to MongoDB
-        try:
-            await db.conversations.insert_one({
-                "id": str(uuid.uuid4()),
-                "messages": [m.dict() for m in request.messages],
-                "response": content,
-                "model": request.model,
-                "usage": usage,
-                "timestamp": datetime.utcnow(),
-            })
-        except Exception as e:
-            logger.warning(f"Failed to save conversation: {e}")
+            tool_call_data = {
+                "id": tc.id,
+                "name": tc.function.name,
+                "arguments": args,
+            }
 
-        return ChatResponse(
-            content=content,
-            model=model_to_use,
-            usage=usage,
-        )
+            logger.info(f"Tool call: {tc.function.name}({args})")
+
+            return ChatResponse(
+                content=None,
+                tool_call=tool_call_data,
+                model=model_to_use,
+                usage=usage,
+            )
+        else:
+            # Normal text response
+            content = choice.message.content or ""
+
+            return ChatResponse(
+                content=content,
+                tool_call=None,
+                model=model_to_use,
+                usage=usage,
+            )
 
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Chat error: {error_msg}")
-        # Return a friendly Jarvis-style error instead of a raw 500
         if "rate_limit" in error_msg.lower() or "429" in error_msg:
             detail = "Together.ai rate limit hit. Give me a moment, sir."
         elif "authentication" in error_msg.lower() or "401" in error_msg:
@@ -518,9 +442,9 @@ async def chat(request: ChatRequest):
 
 @api_router.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
-    """Stream a response from Jarvis (GPT-4o)."""
+    """Stream a response from Jarvis."""
     if not openai_client:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+        raise HTTPException(status_code=500, detail="LLM not configured")
 
     messages = [{"role": "system", "content": JARVIS_SYSTEM_PROMPT}]
     for msg in request.messages:
@@ -546,64 +470,6 @@ async def chat_stream(request: ChatRequest):
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
-
-
-# ─── Direct Binance Endpoints ─────────────────────────────────────
-@api_router.get("/binance/portfolio")
-async def binance_portfolio():
-    """Get Binance portfolio balances."""
-    result = get_portfolio()
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-    return result
-
-@api_router.get("/binance/prices")
-async def binance_prices():
-    """Get prices for major crypto pairs."""
-    result = get_all_prices()
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-    return result
-
-@api_router.get("/binance/price/{symbol}")
-async def binance_price(symbol: str):
-    """Get price for a specific trading pair."""
-    result = get_price(symbol)
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-    return result
-
-@api_router.post("/binance/trade")
-async def binance_trade(request: TradeRequest):
-    """Place a trade on Binance."""
-    result = place_order(
-        symbol=request.symbol,
-        side=request.side,
-        order_type=request.order_type,
-        quantity=request.quantity,
-        price=request.price,
-    )
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-
-    # Log trade to MongoDB
-    try:
-        await db.trades.insert_one({
-            **result,
-            "requested_at": datetime.utcnow(),
-        })
-    except Exception as e:
-        logger.warning(f"Failed to log trade: {e}")
-
-    return result
-
-@api_router.get("/binance/trades")
-async def binance_trades(symbol: str = None, limit: int = 10):
-    """Get recent trades."""
-    result = get_recent_trades(symbol=symbol, limit=limit)
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-    return result
 
 
 # ─── File Upload & Processing ──────────────────────────────────────

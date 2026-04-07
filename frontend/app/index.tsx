@@ -24,7 +24,7 @@ import { Audio } from 'expo-av';
 
 const ELEVENLABS_API_KEY = 'sk_8dd9778f172097e391decb1b8ce43845d40fcbdcbf9cb57d';
 const ELEVENLABS_VOICE_ID = 'WgsC88oU7oxSBORk8LGd'; // User's custom Jarvis 1 voice
-import { parseJarvisResponse, executeToolAction } from '../utils/jarvisParser';
+import { executeToolAction, ToolCall } from '../utils/jarvisParser';
 
 const BACKEND_URL = 'https://jarvis-backend-production-a86c.up.railway.app';
 
@@ -351,19 +351,62 @@ export default function JarvisChat() {
     setAttachedFile(null);
   }, []);
 
-  // Unified tool action processor — handles device, code, trading, and voice actions
+  // Save a message to persistent memory
+  const saveMessage = useCallback(async (role: string, content: string) => {
+    try {
+      await fetch(`${BACKEND_URL}/api/conversation/message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role, content }),
+      });
+    } catch (err) {
+      console.log('Failed to save message:', err);
+    }
+  }, []);
+
+  // Load persistent conversation on mount
+  useEffect(() => {
+    const loadConversation = async () => {
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/conversation`);
+        const data = await res.json();
+        if (data.messages && data.messages.length > 0) {
+          const loaded: Message[] = data.messages.map((m: any, i: number) => ({
+            id: `loaded_${i}`,
+            role: m.role,
+            content: m.content,
+          }));
+          setMessages(loaded);
+        }
+      } catch (err) {
+        console.log('Failed to load conversation:', err);
+      }
+    };
+    loadConversation();
+  }, []);
+
+  // Unified tool action processor — handles device, code, deploy, and voice actions
   const processToolAction = useCallback(async (
-    action: string,
-    args: Record<string, any>,
+    toolCall: ToolCall,
     currentMessages: Message[],
   ) => {
     try {
       // Execute the tool
-      const { result, category } = await executeToolAction(action, args);
+      const { result, category, displayName } = await executeToolAction(toolCall);
 
-      // Voice actions: trigger TTS directly, don't show a separate result bubble
-      if (category === 'voice' && result) {
+      // Voice actions: trigger TTS directly, show the text as a normal message
+      if (category === 'Voice' && result) {
         speakText(result, Date.now().toString());
+        // Update the last assistant message to show the spoken text
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated.length - 1;
+          if (updated[last]?.role === 'assistant') {
+            updated[last] = { ...updated[last], content: result };
+          }
+          return updated;
+        });
+        await saveMessage('assistant', result);
         return;
       }
 
@@ -371,7 +414,7 @@ export default function JarvisChat() {
       const toolResultMsg: Message = {
         id: Date.now().toString() + '_tool',
         role: 'assistant',
-        content: `[${category}: ${action}]\n${result}`,
+        content: `[${category}: ${displayName}]\n${result}`,
       };
       setMessages(prev => [...prev, toolResultMsg]);
 
@@ -382,8 +425,8 @@ export default function JarvisChat() {
 
       const history = [
         ...currentMessages.map(m => ({ role: m.role, content: m.content })),
-        { role: 'user' as const, content: `[Tool result for ${action}]: ${result}` },
-      ].slice(-20);
+        { role: 'user' as const, content: `[Tool result for ${displayName}]: ${result}` },
+      ].slice(-50);
 
       const res = await fetch(`${BACKEND_URL}/api/chat`, {
         method: 'POST',
@@ -391,40 +434,40 @@ export default function JarvisChat() {
         body: JSON.stringify({ messages: history }),
       });
       const data = await res.json();
-      const followUpRaw = data.content || '';
 
-      // Parse the follow-up (it might be another tool call — recursive chain)
-      const followUpParsed = parseJarvisResponse(followUpRaw);
-
-      if (followUpParsed.type === 'text') {
-        setMessages(prev => {
-          const updated = [...prev];
-          const last = updated.length - 1;
-          if (updated[last]?.role === 'assistant' && !updated[last].content) {
-            updated[last] = { ...updated[last], content: followUpParsed.text };
-          }
-          return updated;
-        });
-      } else {
+      if (data.tool_call) {
         // Another tool call in the chain
         const chainMsgs = [...currentMessages, toolResultMsg];
         setMessages(prev => {
           const updated = [...prev];
           const last = updated.length - 1;
           if (updated[last]?.role === 'assistant' && !updated[last].content) {
-            updated[last] = { ...updated[last], content: `Executing: ${followUpParsed.action}...` };
+            updated[last] = { ...updated[last], content: `Executing: ${data.tool_call.name}...` };
           }
           return updated;
         });
-        // Execute OUTSIDE setState
-        processToolAction(followUpParsed.action, followUpParsed.args, chainMsgs);
+        processToolAction(data.tool_call as ToolCall, chainMsgs);
+      } else {
+        // Normal text follow-up
+        const followUpText = data.content || '';
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated.length - 1;
+          if (updated[last]?.role === 'assistant' && !updated[last].content) {
+            updated[last] = { ...updated[last], content: followUpText };
+          }
+          return updated;
+        });
+        if (followUpText) {
+          await saveMessage('assistant', followUpText);
+        }
       }
     } catch (err) {
       console.log('Tool action error:', err);
     } finally {
       setIsGenerating(false);
     }
-  }, [speakText]);
+  }, [speakText, saveMessage]);
 
   const formatFileSize = (bytes: number): string => {
     if (bytes < 1024) return bytes + ' B';
@@ -454,7 +497,7 @@ export default function JarvisChat() {
     try {
       const history = [...messages, userMsg]
         .filter(m => m.role === 'user' || m.role === 'assistant')
-        .slice(-20)
+        .slice(-50)
         .map(m => ({ role: m.role, content: m.content }));
 
       let data;
@@ -495,33 +538,36 @@ export default function JarvisChat() {
         }
       }
 
-      // Parse the response OUTSIDE the state updater (no side effects in setState)
-      const responseText = data.content || 'Empty response from Jarvis.';
-      const parsed = parseJarvisResponse(responseText);
+      // Save user message to persistent memory
+      await saveMessage('user', trimmedText);
 
-      if (parsed.type === 'text') {
-        // Normal text reply — update the assistant message
-        setMessages(prev => {
-          const updated = [...prev];
-          const last = updated.length - 1;
-          if (updated[last]?.role === 'assistant') {
-            updated[last] = { ...updated[last], content: parsed.text };
-          }
-          return updated;
-        });
-      } else {
-        // Tool call — show status message, then execute the tool
+      // Parse the response — check for native tool_call field
+      if (data.tool_call) {
+        // Native tool call from LLM — show status, then execute
         const currentMsgs = [...messages, userMsg, assistantMsg];
         setMessages(prev => {
           const updated = [...prev];
           const last = updated.length - 1;
           if (updated[last]?.role === 'assistant') {
-            updated[last] = { ...updated[last], content: `Executing: ${parsed.action}...` };
+            updated[last] = { ...updated[last], content: `Executing: ${data.tool_call.name}...` };
           }
           return updated;
         });
-        // Execute tool OUTSIDE setState — this is the critical fix
-        processToolAction(parsed.action, parsed.args, currentMsgs);
+        // Execute tool OUTSIDE setState
+        processToolAction(data.tool_call as ToolCall, currentMsgs);
+      } else {
+        // Normal text reply
+        const responseText = data.content || 'Empty response from Jarvis.';
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated.length - 1;
+          if (updated[last]?.role === 'assistant') {
+            updated[last] = { ...updated[last], content: responseText };
+          }
+          return updated;
+        });
+        // Save assistant response to persistent memory
+        await saveMessage('assistant', responseText);
       }
     } catch (err) {
       setMessages(prev => {
