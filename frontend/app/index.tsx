@@ -396,20 +396,29 @@ export default function JarvisChat() {
       // Parse the follow-up (it might be another tool call — recursive chain)
       const followUpParsed = parseJarvisResponse(followUpRaw);
 
-      setMessages(prev => {
-        const updated = [...prev];
-        const last = updated.length - 1;
-        if (updated[last]?.role === 'assistant' && !updated[last].content) {
-          if (followUpParsed.type === 'text') {
+      if (followUpParsed.type === 'text') {
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated.length - 1;
+          if (updated[last]?.role === 'assistant' && !updated[last].content) {
             updated[last] = { ...updated[last], content: followUpParsed.text };
-          } else {
-            updated[last] = { ...updated[last], content: `Executing: ${followUpParsed.action}...` };
-            // Recursive: execute the next tool in the chain
-            processToolAction(followUpParsed.action, followUpParsed.args, [...updated]);
           }
-        }
-        return updated;
-      });
+          return updated;
+        });
+      } else {
+        // Another tool call in the chain
+        const chainMsgs = [...currentMessages, toolResultMsg];
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated.length - 1;
+          if (updated[last]?.role === 'assistant' && !updated[last].content) {
+            updated[last] = { ...updated[last], content: `Executing: ${followUpParsed.action}...` };
+          }
+          return updated;
+        });
+        // Execute OUTSIDE setState
+        processToolAction(followUpParsed.action, followUpParsed.args, chainMsgs);
+      }
     } catch (err) {
       console.log('Tool action error:', err);
     } finally {
@@ -486,26 +495,34 @@ export default function JarvisChat() {
         }
       }
 
-      setMessages(prev => {
-        const updated = [...prev];
-        const last = updated.length - 1;
-        if (updated[last]?.role === 'assistant') {
-          const responseText = data.content || 'Empty response from Jarvis.';
+      // Parse the response OUTSIDE the state updater (no side effects in setState)
+      const responseText = data.content || 'Empty response from Jarvis.';
+      const parsed = parseJarvisResponse(responseText);
 
-          // Parse the structured JSON response from Jarvis
-          const parsed = parseJarvisResponse(responseText);
-
-          if (parsed.type === 'text') {
-            // Normal text reply
+      if (parsed.type === 'text') {
+        // Normal text reply — update the assistant message
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated.length - 1;
+          if (updated[last]?.role === 'assistant') {
             updated[last] = { ...updated[last], content: parsed.text };
-          } else {
-            // Tool call — show status, then execute in background
-            updated[last] = { ...updated[last], content: `Executing: ${parsed.action}...` };
-            processToolAction(parsed.action, parsed.args, [...updated]);
           }
-        }
-        return updated;
-      });
+          return updated;
+        });
+      } else {
+        // Tool call — show status message, then execute the tool
+        const currentMsgs = [...messages, userMsg, assistantMsg];
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated.length - 1;
+          if (updated[last]?.role === 'assistant') {
+            updated[last] = { ...updated[last], content: `Executing: ${parsed.action}...` };
+          }
+          return updated;
+        });
+        // Execute tool OUTSIDE setState — this is the critical fix
+        processToolAction(parsed.action, parsed.args, currentMsgs);
+      }
     } catch (err) {
       setMessages(prev => {
         const updated = [...prev];
