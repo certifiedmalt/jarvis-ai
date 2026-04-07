@@ -1,12 +1,12 @@
 /**
  * jarvisParser.ts
  *
- * Parses the structured JSON that the LLM returns and routes
- * each action to the correct handler on the device.
+ * Parses the structured JSON that the LLM returns using the AppFramework
+ * architecture and routes each action to the correct handler on the device.
  *
  * Expected LLM output formats:
  *   A) {"action": "none", "response": "Hello sir."}
- *   B) {"action": "getCryptoPrice", "args": {"symbol": "BTCUSDT"}}
+ *   B) {"action": "AppFramework.Code.readCodeFile", "args": {"path": "backend/server.py"}}
  */
 
 import { executeDeviceAction, DeviceAction } from './deviceActions';
@@ -23,11 +23,9 @@ export type ParsedResponse =
 // ── Main parser ────────────────────────────────────────────────────
 
 export function parseJarvisResponse(raw: string): ParsedResponse {
-  // Try to extract JSON from the response
   const jsonString = extractJson(raw);
 
   if (!jsonString) {
-    // Not JSON — return raw text as-is
     return { type: 'text', text: raw };
   }
 
@@ -86,119 +84,126 @@ function extractJson(raw: string): string | null {
 // ── Tool Execution Router ──────────────────────────────────────────
 
 /**
+ * Resolves an AppFramework action string like "AppFramework.Device.getContacts"
+ * into { module: "Device", func: "getContacts" }.
+ */
+function resolveAction(action: string): { module: string; func: string } {
+  // Handle "AppFramework.Module.function" format
+  const parts = action.split('.');
+  if (parts.length === 3 && parts[0] === 'AppFramework') {
+    return { module: parts[1], func: parts[2] };
+  }
+  // Handle legacy "functionName" format (backwards compatible)
+  if (parts.length === 1) {
+    // Try to infer module from function name
+    const func = parts[0];
+    if (['getContacts', 'getCalendarEvents', 'getLocation', 'copyToClipboard', 'shareContent'].includes(func)) {
+      return { module: 'Device', func };
+    }
+    if (['listRepoPaths', 'readCodeFile', 'writeCodeFile', 'commitAndPush'].includes(func)) {
+      return { module: 'Code', func };
+    }
+    if (['triggerIOSBuild', 'submitToTestFlight'].includes(func)) {
+      return { module: 'Deploy', func };
+    }
+    if (['getCryptoPrice', 'getPortfolioBalances', 'getTradeHistory', 'placeMarketOrder', 'placeLimitOrder'].includes(func)) {
+      return { module: 'Trading', func };
+    }
+    if (func === 'speak') {
+      return { module: 'Voice', func };
+    }
+  }
+  return { module: 'Unknown', func: action };
+}
+
+/**
  * Executes a tool action and returns a human-readable result string.
  */
 export async function executeToolAction(
   action: string,
   args: Record<string, any>,
-  speakFn?: (text: string, msgId: string) => void,
 ): Promise<{ result: string; category: string }> {
-  // ── Device Actions ───────────────────────────────────────────
-  if (isDeviceAction(action)) {
-    const deviceAction = mapToDeviceAction(action, args);
-    const result = await executeDeviceAction(deviceAction);
-    return { result, category: 'device' };
-  }
+  const { module: mod, func } = resolveAction(action);
 
-  // ── Self-Update / Code Actions ───────────────────────────────
-  if (isSelfUpdateAction(action)) {
-    const updateAction = mapToSelfUpdateAction(action, args);
-    const result = await executeSelfUpdate(updateAction);
-    return { result, category: 'code' };
-  }
+  switch (mod) {
+    case 'Device':
+      return { result: await executeDeviceHandler(func, args), category: 'Device' };
 
-  // ── Trading Actions ──────────────────────────────────────────
-  if (isTradingAction(action)) {
-    const result = await executeTradingAction(action, args);
-    return { result, category: 'trading' };
-  }
+    case 'Code':
+      return { result: await executeCodeHandler(func, args), category: 'Code' };
 
-  // ── Voice ────────────────────────────────────────────────────
-  if (action === 'speak') {
-    // Handled separately in index.tsx via speakFn callback
-    return { result: args.text || '', category: 'voice' };
-  }
+    case 'Deploy':
+      return { result: await executeDeployHandler(func, args), category: 'Deploy' };
 
-  return { result: `Unknown tool: ${action}`, category: 'unknown' };
-}
+    case 'Trading':
+      return { result: await executeTradingHandler(func, args), category: 'Trading' };
 
-// ── Category Checks ────────────────────────────────────────────────
+    case 'Voice':
+      // Voice is handled in index.tsx via speakText callback
+      return { result: args.text || '', category: 'Voice' };
 
-function isDeviceAction(action: string): boolean {
-  return [
-    'getContacts', 'getCalendarEvents', 'getLocation',
-    'copyToClipboard', 'shareContent',
-  ].includes(action);
-}
-
-function isSelfUpdateAction(action: string): boolean {
-  return [
-    'readCodeFile', 'listRepoPaths', 'writeCodeFile',
-    'commitAndPush', 'triggerIOSBuild', 'submitToTestFlight',
-  ].includes(action);
-}
-
-function isTradingAction(action: string): boolean {
-  return [
-    'getCryptoPrice', 'getPortfolioBalances', 'getTradeHistory',
-    'placeMarketOrder', 'placeLimitOrder',
-  ].includes(action);
-}
-
-// ── Mappers ────────────────────────────────────────────────────────
-
-function mapToDeviceAction(action: string, args: Record<string, any>): DeviceAction {
-  switch (action) {
-    case 'getContacts':
-      return { action: 'get_contacts', search: args.query ?? undefined };
-    case 'getCalendarEvents':
-      return { action: 'get_calendar', days: args.days ?? 7 };
-    case 'getLocation':
-      return { action: 'get_location' };
-    case 'copyToClipboard':
-      return { action: 'clipboard', text: args.text ?? '' };
-    case 'shareContent':
-      return { action: 'share', text: args.text ?? '' };
     default:
-      return { action: action };
+      return { result: `Unknown AppFramework module: ${mod}.${func}`, category: 'Unknown' };
   }
 }
 
-function mapToSelfUpdateAction(action: string, args: Record<string, any>): SelfUpdateAction {
-  switch (action) {
-    case 'readCodeFile':
-      return { action: 'read', file_path: args.path ?? '' };
-    case 'listRepoPaths':
-      return { action: 'list', dir_path: args.path ?? '' };
-    case 'writeCodeFile':
-      return {
-        action: 'write',
-        file_path: args.path ?? '',
-        content: args.content ?? '',
-        commit_message: args.commit_message ?? 'JARVIS self-update',
-      };
-    case 'commitAndPush':
-      return { action: 'write', commit_message: args.message ?? 'JARVIS commit' };
-    case 'triggerIOSBuild':
-    case 'submitToTestFlight':
-      return { action: 'build' };
-    default:
-      return { action: action };
-  }
+// ── Device Handler ─────────────────────────────────────────────────
+
+async function executeDeviceHandler(func: string, args: Record<string, any>): Promise<string> {
+  const actionMap: Record<string, DeviceAction> = {
+    getContacts: { action: 'get_contacts', search: args.query ?? undefined },
+    getCalendarEvents: { action: 'get_calendar', days: args.days ?? 7 },
+    getLocation: { action: 'get_location' },
+    copyToClipboard: { action: 'clipboard', text: args.text ?? '' },
+    shareContent: { action: 'share', text: args.text ?? '' },
+  };
+
+  const deviceAction = actionMap[func];
+  if (!deviceAction) return `Unknown Device function: ${func}`;
+  return await executeDeviceAction(deviceAction);
 }
 
-// ── Trading Execution ──────────────────────────────────────────────
+// ── Code Handler ───────────────────────────────────────────────────
 
-async function executeTradingAction(
-  action: string,
-  args: Record<string, any>,
-): Promise<string> {
+async function executeCodeHandler(func: string, args: Record<string, any>): Promise<string> {
+  const actionMap: Record<string, SelfUpdateAction> = {
+    listRepoPaths: { action: 'list', dir_path: args.path ?? '' },
+    readCodeFile: { action: 'read', file_path: args.path ?? '' },
+    writeCodeFile: {
+      action: 'write',
+      file_path: args.path ?? '',
+      content: args.content ?? '',
+      commit_message: args.commit_message ?? 'JARVIS self-update',
+    },
+    commitAndPush: {
+      action: 'write',
+      commit_message: args.message ?? 'JARVIS commit',
+    },
+  };
+
+  const updateAction = actionMap[func];
+  if (!updateAction) return `Unknown Code function: ${func}`;
+  return await executeSelfUpdate(updateAction);
+}
+
+// ── Deploy Handler ─────────────────────────────────────────────────
+
+async function executeDeployHandler(func: string, _args: Record<string, any>): Promise<string> {
+  if (func === 'triggerIOSBuild' || func === 'submitToTestFlight') {
+    return await executeSelfUpdate({ action: 'build' });
+  }
+  return `Unknown Deploy function: ${func}`;
+}
+
+// ── Trading Handler ────────────────────────────────────────────────
+
+async function executeTradingHandler(func: string, args: Record<string, any>): Promise<string> {
   try {
     let url = '';
     let method = 'GET';
     let body: string | undefined;
 
-    switch (action) {
+    switch (func) {
       case 'getCryptoPrice':
         url = `${BACKEND_URL}/api/binance/price/${args.symbol || 'BTCUSDT'}`;
         break;
@@ -230,7 +235,7 @@ async function executeTradingAction(
         });
         break;
       default:
-        return `Unknown trading action: ${action}`;
+        return `Unknown Trading function: ${func}`;
     }
 
     const opts: RequestInit = { method, headers: { 'Content-Type': 'application/json' } };
