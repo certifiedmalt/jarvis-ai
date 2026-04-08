@@ -426,13 +426,13 @@ export default function JarvisChat() {
 
     setToolDepth(depth + 1);
 
-    const SAFETY_LIMIT = 10;  // Emergency brake only — Jarvis should self-terminate before this
+    const SAFETY_LIMIT = 12;  // Emergency brake — Jarvis should self-terminate before this
     if (depth >= SAFETY_LIMIT) {
       setMessages(prev => {
         const updated = [...prev];
         const last = updated.length - 1;
         if (updated[last]?.role === 'assistant') {
-          updated[last] = { ...updated[last], content: 'I\'ve hit my safety limit of 10 consecutive tool calls. Let me stop here and summarise what I\'ve done so far, sir.' };
+          updated[last] = { ...updated[last], content: 'I\'ve hit my safety limit of 12 consecutive tool calls. Let me stop here and summarise what I\'ve done so far, sir.' };
         }
         return updated;
       });

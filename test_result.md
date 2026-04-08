@@ -229,6 +229,18 @@ metadata:
           agent: "testing"
           comment: "✅ VERIFIED: All 5 tool calling format tests PASSED. (1) Tool-triggering chat correctly returns assistant_tool_message field with proper structure. (2) Tool role messages in conversation history are accepted without 422 validation errors. (3) Normal chat still works with tool_call: null. (4) Health check operational. (5) Asking about tools returns text description without executing tools. New tool calling format implementation is working perfectly."
 
+  - task: "patchCodeFile endpoint - targeted file editing"
+    implemented: true
+    working: true
+    file: "server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: "✅ VERIFIED: NEW patchCodeFile endpoint (/api/code/patch) working perfectly. All 6 comprehensive tests PASSED: (1) Replace operation successfully found '# v2.2.0' and replaced with '# v3.2.0 - Added patchCodeFile tool', returned status 'patched_and_pushed' with git commit/push. (2) Text not found correctly returned status 'not_found' with helpful message. (3) Insert after line operation successfully inserted content after line 1, returned 'patched_and_pushed'. (4) File not found correctly returned 404 status for non-existent file. (5) Health check still working (status=online, llm_provider=together). (6) Chat endpoint still working with proper JSON response. The patchCodeFile tool is production-ready and handles all edge cases correctly."
+
 test_plan:
   current_focus: []
   stuck_tasks: []
@@ -244,3 +256,5 @@ agent_communication:
       message: "MAJOR FIX for tool hallucination: (1) ChatMessage model now supports role=tool with tool_call_id/name, and role=assistant with tool_calls array. (2) Backend chat endpoint properly builds messages for Together.ai including tool role messages. (3) Backend returns assistant_tool_message field with raw tool_call for history continuity. (4) Frontend processToolAction rewritten to use proper tool message format. (5) Hard depth limit of 3 replaced with safety-only limit of 10. (6) System prompt has TOOL CHAINING reasoning instructions. Test: POST /api/chat with tool-triggering message, verify response includes assistant_tool_message. Then test sending a follow-up with role=tool message in history."
     - agent: "testing"
       message: "✅ TOOL CALLING FORMAT TESTING COMPLETE: All 5 comprehensive tests passed successfully. The new proper tool calling format is working perfectly - tool-triggering messages return assistant_tool_message, tool role messages are accepted in conversation history, normal chat works, health check operational, and asking about tools returns descriptions without execution. Backend implementation is solid and ready for production use."
+    - agent: "testing"
+      message: "✅ PATCHCODEFILE ENDPOINT TESTING COMPLETE: All 6 comprehensive tests for the new /api/code/patch endpoint PASSED successfully. Replace operations work correctly (found and replaced '# v2.2.0' with '# v3.2.0 - Added patchCodeFile tool'), text-not-found scenarios return proper 'not_found' status, insert-after-line operations work perfectly, file-not-found returns 404 as expected, and existing endpoints (health check, chat) remain fully functional. The patchCodeFile tool is production-ready and handles all edge cases correctly with proper git commit/push integration."

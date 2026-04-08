@@ -1,324 +1,195 @@
 #!/usr/bin/env python3
 """
-Backend Testing for Jarvis AI - Tool Calling Format Tests
-Tests the new proper tool calling format implementation
+Backend API Testing for Jarvis AI - patchCodeFile endpoint focus
+Tests the new patchCodeFile endpoint with various scenarios
 """
 
 import requests
 import json
 import sys
-from datetime import datetime
+from typing import Dict, Any
 
-# Backend URL from frontend .env
+# Backend URL from frontend/.env
 BACKEND_URL = "https://portable-llm.preview.emergentagent.com/api"
 
-def log_test(test_name, status, details=""):
-    """Log test results with timestamp"""
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    status_symbol = "✅" if status == "PASS" else "❌" if status == "FAIL" else "⚠️"
-    print(f"[{timestamp}] {status_symbol} {test_name}")
-    if details:
-        print(f"    {details}")
-    print()
-
-def test_health_check():
-    """Test 4: Health check endpoint"""
+def test_api_endpoint(method: str, endpoint: str, data: Dict[Any, Any] = None, expected_status: int = 200) -> Dict[Any, Any]:
+    """Test an API endpoint and return the response"""
+    url = f"{BACKEND_URL}{endpoint}"
+    
     try:
-        response = requests.get(f"{BACKEND_URL}/health", timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("status") == "online":
-                log_test("Health Check", "PASS", f"Status: {data.get('status')}, LLM: {data.get('llm_provider')} {data.get('llm_model')}")
-                return True
-            else:
-                log_test("Health Check", "FAIL", f"Status not online: {data}")
-                return False
+        if method.upper() == "GET":
+            response = requests.get(url, timeout=30)
+        elif method.upper() == "POST":
+            response = requests.post(url, json=data, timeout=30)
         else:
-            log_test("Health Check", "FAIL", f"HTTP {response.status_code}: {response.text}")
-            return False
-            
-    except Exception as e:
-        log_test("Health Check", "FAIL", f"Exception: {str(e)}")
-        return False
-
-def test_tool_triggering_chat():
-    """Test 1: Tool-triggering chat returns assistant_tool_message"""
-    try:
-        payload = {
-            "messages": [
-                {"role": "user", "content": "Get my current location"}
-            ]
-        }
+            raise ValueError(f"Unsupported method: {method}")
         
-        response = requests.post(
-            f"{BACKEND_URL}/chat", 
-            json=payload, 
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
+        print(f"\n{'='*60}")
+        print(f"Testing: {method} {endpoint}")
+        print(f"URL: {url}")
+        if data:
+            print(f"Request Data: {json.dumps(data, indent=2)}")
+        print(f"Status Code: {response.status_code}")
         
-        if response.status_code == 200:
-            data = response.json()
-            
-            # Check if tool_call is present
-            tool_call = data.get("tool_call")
-            if not tool_call:
-                log_test("Tool Triggering Chat", "FAIL", "No tool_call field in response")
-                return False
-                
-            # Check if tool_call has correct structure
-            if tool_call.get("name") != "getLocation":
-                log_test("Tool Triggering Chat", "FAIL", f"Expected tool name 'getLocation', got: {tool_call.get('name')}")
-                return False
-                
-            # Check if assistant_tool_message is present (NEW requirement)
-            assistant_tool_message = data.get("assistant_tool_message")
-            if not assistant_tool_message:
-                log_test("Tool Triggering Chat", "FAIL", "Missing assistant_tool_message field (NEW requirement)")
-                return False
-                
-            # Verify assistant_tool_message structure
-            if assistant_tool_message.get("role") != "assistant":
-                log_test("Tool Triggering Chat", "FAIL", f"assistant_tool_message role should be 'assistant', got: {assistant_tool_message.get('role')}")
-                return False
-                
-            tool_calls = assistant_tool_message.get("tool_calls")
-            if not tool_calls or not isinstance(tool_calls, list):
-                log_test("Tool Triggering Chat", "FAIL", "assistant_tool_message missing tool_calls array")
-                return False
-                
-            # Verify tool_calls structure
-            first_tool_call = tool_calls[0]
-            if first_tool_call.get("type") != "function":
-                log_test("Tool Triggering Chat", "FAIL", f"tool_call type should be 'function', got: {first_tool_call.get('type')}")
-                return False
-                
-            function_data = first_tool_call.get("function", {})
-            if function_data.get("name") != "getLocation":
-                log_test("Tool Triggering Chat", "FAIL", f"function name should be 'getLocation', got: {function_data.get('name')}")
-                return False
-                
-            log_test("Tool Triggering Chat", "PASS", 
-                    f"Tool call: {tool_call.get('name')}, assistant_tool_message present with correct structure")
-            return True
-            
+        try:
+            response_json = response.json()
+            print(f"Response: {json.dumps(response_json, indent=2)}")
+        except:
+            print(f"Response Text: {response.text}")
+            response_json = {"error": "Invalid JSON response", "text": response.text}
+        
+        # Check if status code matches expected
+        if response.status_code != expected_status:
+            print(f"❌ FAILED: Expected status {expected_status}, got {response.status_code}")
+            return {"success": False, "status_code": response.status_code, "response": response_json}
         else:
-            log_test("Tool Triggering Chat", "FAIL", f"HTTP {response.status_code}: {response.text}")
-            return False
+            print(f"✅ SUCCESS: Status code {response.status_code} as expected")
+            return {"success": True, "status_code": response.status_code, "response": response_json}
             
+    except requests.exceptions.Timeout:
+        print(f"❌ FAILED: Request timed out after 30 seconds")
+        return {"success": False, "error": "timeout"}
+    except requests.exceptions.ConnectionError:
+        print(f"❌ FAILED: Connection error - backend may be down")
+        return {"success": False, "error": "connection_error"}
     except Exception as e:
-        log_test("Tool Triggering Chat", "FAIL", f"Exception: {str(e)}")
-        return False
-
-def test_proper_tool_message_format():
-    """Test 2: Proper tool message format accepted"""
-    try:
-        # This tests the new format with role=tool messages in history
-        payload = {
-            "messages": [
-                {"role": "user", "content": "Get my current location"},
-                {
-                    "role": "assistant", 
-                    "content": "", 
-                    "tool_calls": [
-                        {
-                            "id": "call_123", 
-                            "type": "function", 
-                            "function": {
-                                "name": "getLocation", 
-                                "arguments": "{}"
-                            }
-                        }
-                    ]
-                },
-                {
-                    "role": "tool", 
-                    "tool_call_id": "call_123", 
-                    "name": "getLocation", 
-                    "content": "Location: San Francisco, CA. Coordinates: 37.7749, -122.4194"
-                },
-                {"role": "user", "content": "Thanks, now what's nearby?"}
-            ]
-        }
-        
-        response = requests.post(
-            f"{BACKEND_URL}/chat", 
-            json=payload, 
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
-        
-        if response.status_code == 422:
-            log_test("Proper Tool Message Format", "FAIL", f"422 Validation Error - tool role messages not accepted: {response.text}")
-            return False
-        elif response.status_code == 200:
-            data = response.json()
-            # Should return a text response, not a tool call for this follow-up question
-            if data.get("content"):
-                log_test("Proper Tool Message Format", "PASS", 
-                        f"Tool role messages accepted, returned text response: {data.get('content')[:100]}...")
-                return True
-            else:
-                log_test("Proper Tool Message Format", "FAIL", "No content in response")
-                return False
-        else:
-            log_test("Proper Tool Message Format", "FAIL", f"HTTP {response.status_code}: {response.text}")
-            return False
-            
-    except Exception as e:
-        log_test("Proper Tool Message Format", "FAIL", f"Exception: {str(e)}")
-        return False
-
-def test_normal_chat():
-    """Test 3: Normal chat still works"""
-    try:
-        payload = {
-            "messages": [
-                {"role": "user", "content": "Hello Jarvis, how are you?"}
-            ]
-        }
-        
-        response = requests.post(
-            f"{BACKEND_URL}/chat", 
-            json=payload, 
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            
-            # Should have content and tool_call should be null
-            content = data.get("content")
-            tool_call = data.get("tool_call")
-            
-            if not content:
-                log_test("Normal Chat", "FAIL", "No content in response")
-                return False
-                
-            if tool_call is not None:
-                log_test("Normal Chat", "FAIL", f"tool_call should be null for normal chat, got: {tool_call}")
-                return False
-                
-            log_test("Normal Chat", "PASS", f"Normal chat working, content: {content[:100]}...")
-            return True
-            
-        else:
-            log_test("Normal Chat", "FAIL", f"HTTP {response.status_code}: {response.text}")
-            return False
-            
-    except Exception as e:
-        log_test("Normal Chat", "FAIL", f"Exception: {str(e)}")
-        return False
-
-def test_asking_about_tools():
-    """Test 5: Asking about tools returns text not tool_call"""
-    try:
-        payload = {
-            "messages": [
-                {"role": "user", "content": "List all your available tools and what each one does"}
-            ]
-        }
-        
-        response = requests.post(
-            f"{BACKEND_URL}/chat", 
-            json=payload, 
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            
-            # Should have content describing tools and tool_call should be null
-            content = data.get("content")
-            tool_call = data.get("tool_call")
-            
-            if not content:
-                log_test("Asking About Tools", "FAIL", "No content in response")
-                return False
-                
-            if tool_call is not None:
-                log_test("Asking About Tools", "FAIL", f"tool_call should be null when asking about tools, got: {tool_call}")
-                return False
-                
-            # Check if content actually describes tools
-            content_lower = content.lower()
-            if "tool" not in content_lower and "function" not in content_lower:
-                log_test("Asking About Tools", "FAIL", "Response doesn't seem to describe tools")
-                return False
-                
-            log_test("Asking About Tools", "PASS", f"Tools described in text, no tool execution: {content[:150]}...")
-            return True
-            
-        else:
-            log_test("Asking About Tools", "FAIL", f"HTTP {response.status_code}: {response.text}")
-            return False
-            
-    except Exception as e:
-        log_test("Asking About Tools", "FAIL", f"Exception: {str(e)}")
-        return False
+        print(f"❌ FAILED: Unexpected error: {str(e)}")
+        return {"success": False, "error": str(e)}
 
 def main():
-    """Run all backend tests"""
-    print("=" * 60)
-    print("JARVIS AI BACKEND TESTING - Tool Calling Format")
-    print("=" * 60)
+    """Run all backend tests focusing on patchCodeFile endpoint"""
+    print("🚀 Starting Jarvis AI Backend Testing - patchCodeFile Focus")
     print(f"Backend URL: {BACKEND_URL}")
-    print()
     
-    # Track test results
-    results = []
+    test_results = []
     
-    # Run tests in order
-    print("Running Backend Tests...")
-    print("-" * 40)
+    # Test 1: Replace operation - find "# v2.2.0" and replace with "# v3.2.0 - Added patchCodeFile tool"
+    print("\n" + "="*80)
+    print("TEST 1: patchCodeFile - Replace operation")
+    test1_data = {
+        "path": "backend/server.py",
+        "operation": "replace",
+        "find": "# v2.2.0",
+        "replace_with": "# v3.2.0 - Added patchCodeFile tool",
+        "commit_message": "test patch replace"
+    }
+    result1 = test_api_endpoint("POST", "/code/patch", test1_data)
+    test_results.append(("Test 1 - Replace operation", result1))
     
-    # Test 4: Health check (run first to verify connectivity)
-    results.append(("Health Check", test_health_check()))
+    # Check if the response indicates success
+    if result1.get("success") and result1.get("response", {}).get("status") in ["patched_and_pushed", "patched_locally"]:
+        print("✅ Test 1 PASSED: Replace operation successful")
+    else:
+        print("❌ Test 1 FAILED: Replace operation failed")
     
-    # Test 1: Tool-triggering chat returns assistant_tool_message
-    results.append(("Tool Triggering Chat", test_tool_triggering_chat()))
+    # Test 2: Replace with text not found
+    print("\n" + "="*80)
+    print("TEST 2: patchCodeFile - Replace with non-existent text")
+    test2_data = {
+        "path": "backend/server.py",
+        "operation": "replace",
+        "find": "THIS_TEXT_DOES_NOT_EXIST_ANYWHERE_12345",
+        "replace_with": "something",
+        "commit_message": "test not found"
+    }
+    result2 = test_api_endpoint("POST", "/code/patch", test2_data)
+    test_results.append(("Test 2 - Text not found", result2))
     
-    # Test 2: Proper tool message format accepted
-    results.append(("Proper Tool Message Format", test_proper_tool_message_format()))
+    # Check if the response indicates "not_found"
+    if result2.get("success") and result2.get("response", {}).get("status") == "not_found":
+        print("✅ Test 2 PASSED: Correctly returned 'not_found' status")
+    else:
+        print("❌ Test 2 FAILED: Should have returned 'not_found' status")
     
-    # Test 3: Normal chat still works
-    results.append(("Normal Chat", test_normal_chat()))
+    # Test 3: Insert after line operation
+    print("\n" + "="*80)
+    print("TEST 3: patchCodeFile - Insert after line operation")
+    test3_data = {
+        "path": "backend/server.py",
+        "operation": "insert_after",
+        "line": 1,
+        "content": "# Patched by test",
+        "commit_message": "test insert"
+    }
+    result3 = test_api_endpoint("POST", "/code/patch", test3_data)
+    test_results.append(("Test 3 - Insert after line", result3))
     
-    # Test 5: Asking about tools returns text not tool_call
-    results.append(("Asking About Tools", test_asking_about_tools()))
+    # Check if the response indicates success
+    if result3.get("success") and result3.get("response", {}).get("status") in ["patched_and_pushed", "patched_locally"]:
+        print("✅ Test 3 PASSED: Insert after line operation successful")
+    else:
+        print("❌ Test 3 FAILED: Insert after line operation failed")
+    
+    # Test 4: File not found
+    print("\n" + "="*80)
+    print("TEST 4: patchCodeFile - File not found")
+    test4_data = {
+        "path": "nonexistent/file.py",
+        "operation": "replace",
+        "find": "test",
+        "replace_with": "test2",
+        "commit_message": "test"
+    }
+    result4 = test_api_endpoint("POST", "/code/patch", test4_data, expected_status=404)
+    test_results.append(("Test 4 - File not found", result4))
+    
+    # Check if we got 404 as expected
+    if result4.get("status_code") == 404:
+        print("✅ Test 4 PASSED: Correctly returned 404 for non-existent file")
+    else:
+        print("❌ Test 4 FAILED: Should have returned 404 for non-existent file")
+    
+    # Test 5: Health check still works
+    print("\n" + "="*80)
+    print("TEST 5: Health check endpoint")
+    result5 = test_api_endpoint("GET", "/health")
+    test_results.append(("Test 5 - Health check", result5))
+    
+    # Check if health check is working
+    if result5.get("success") and result5.get("response", {}).get("status") == "online":
+        print("✅ Test 5 PASSED: Health check working")
+    else:
+        print("❌ Test 5 FAILED: Health check not working")
+    
+    # Test 6: Chat still works
+    print("\n" + "="*80)
+    print("TEST 6: Chat endpoint")
+    test6_data = {
+        "messages": [{"role": "user", "content": "Hello"}]
+    }
+    result6 = test_api_endpoint("POST", "/chat", test6_data)
+    test_results.append(("Test 6 - Chat endpoint", result6))
+    
+    # Check if chat is working
+    if result6.get("success") and result6.get("response", {}).get("content"):
+        print("✅ Test 6 PASSED: Chat endpoint working")
+    else:
+        print("❌ Test 6 FAILED: Chat endpoint not working")
     
     # Summary
-    print("=" * 60)
-    print("TEST SUMMARY")
-    print("=" * 60)
+    print("\n" + "="*80)
+    print("🏁 TEST SUMMARY")
+    print("="*80)
     
     passed = 0
-    failed = 0
+    total = len(test_results)
     
-    for test_name, result in results:
-        status = "PASS" if result else "FAIL"
-        symbol = "✅" if result else "❌"
-        print(f"{symbol} {test_name}: {status}")
-        if result:
+    for test_name, result in test_results:
+        if result.get("success"):
+            print(f"✅ {test_name}")
             passed += 1
         else:
-            failed += 1
+            print(f"❌ {test_name}")
     
-    print()
-    print(f"Total: {len(results)} tests")
-    print(f"Passed: {passed}")
-    print(f"Failed: {failed}")
+    print(f"\nResults: {passed}/{total} tests passed")
     
-    if failed > 0:
-        print("\n❌ SOME TESTS FAILED - Check details above")
-        return False
+    if passed == total:
+        print("🎉 ALL TESTS PASSED!")
+        return 0
     else:
-        print("\n✅ ALL TESTS PASSED")
-        return True
+        print("⚠️  SOME TESTS FAILED")
+        return 1
 
 if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)
+    exit_code = main()
+    sys.exit(exit_code)

@@ -79,6 +79,11 @@ async function executeCodeHandler(name: string, args: Record<string, any>): Prom
     return await executeCommitAndPush(args.message ?? 'JARVIS commit');
   }
 
+  // patchCodeFile uses the dedicated patch endpoint
+  if (name === 'patchCodeFile') {
+    return await executePatchCode(args);
+  }
+
   const actionMap: Record<string, SelfUpdateAction> = {
     listRepoPaths: { action: 'list', dir_path: args.path ?? '' },
     readCodeFile: { action: 'read', file_path: args.path ?? '' },
@@ -93,6 +98,31 @@ async function executeCodeHandler(name: string, args: Record<string, any>): Prom
   const updateAction = actionMap[name];
   if (!updateAction) return `Unknown Code function: ${name}`;
   return await executeSelfUpdate(updateAction);
+}
+
+async function executePatchCode(args: Record<string, any>): Promise<string> {
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/code/patch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        path: args.path ?? '',
+        operation: args.operation ?? 'replace',
+        find: args.find ?? null,
+        replace_with: args.replace_with ?? null,
+        line: args.line ?? null,
+        content: args.content ?? null,
+        commit_message: args.commit_message ?? 'JARVIS patch',
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) return `Patch error: ${data.detail || 'Unknown error'}`;
+    if (data.status === 'not_found') return `Patch failed: ${data.message}. File has ${data.file_lines} lines.`;
+    if (data.status === 'invalid_line') return `Patch failed: ${data.message}`;
+    return `Patched ${data.file} (${data.operation}): ${data.status}. ${data.message || ''}`;
+  } catch (err: any) {
+    return `Patch failed: ${err.message || String(err)}`;
+  }
 }
 
 async function executeCommitAndPush(message: string): Promise<string> {
