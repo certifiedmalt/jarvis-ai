@@ -476,10 +476,29 @@ async def chat_stream(request: ChatRequest):
 GITHUB_PAT = os.getenv("GITHUB_PAT", "")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "certifiedmalt/jarvis-ai")
 
+async def get_github_pat() -> str:
+    """Get GITHUB_PAT from env or MongoDB settings."""
+    if GITHUB_PAT:
+        return GITHUB_PAT
+    doc = await db.jarvis_settings.find_one({"_id": "github_pat"})
+    return doc.get("value", "") if doc else ""
+
+@api_router.post("/settings/{key}")
+async def set_setting(key: str, value: str = ""):
+    """Store a setting in MongoDB."""
+    await db.jarvis_settings.update_one(
+        {"_id": key},
+        {"$set": {"value": value}},
+        upsert=True,
+    )
+    return {"status": "saved", "key": key}
+
 @api_router.post("/deploy/build")
 async def deploy_build(action: str = "build_and_submit"):
     """Trigger iOS build + TestFlight submit via GitHub Actions."""
-    if not GITHUB_PAT:
+    pat = await get_github_pat()
+    if not pat:
+        raise HTTPException(status_code=500, detail="GitHub PAT not configured. Use POST /api/settings/github_pat to set it.")
         raise HTTPException(status_code=500, detail="GitHub PAT not configured on server.")
 
     valid_actions = ["build", "submit", "build_and_submit"]
@@ -492,7 +511,7 @@ async def deploy_build(action: str = "build_and_submit"):
             r = await client.post(
                 f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/build-ios.yml/dispatches",
                 headers={
-                    "Authorization": f"token {GITHUB_PAT}",
+                    "Authorization": f"token {pat}",
                     "Accept": "application/vnd.github.v3+json",
                 },
                 json={"ref": "main", "inputs": {"action": action}},
@@ -525,7 +544,8 @@ async def deploy_build(action: str = "build_and_submit"):
 @api_router.get("/deploy/status")
 async def deploy_status():
     """Check the latest GitHub Actions workflow run status."""
-    if not GITHUB_PAT:
+    pat = await get_github_pat()
+    if not pat:
         raise HTTPException(status_code=500, detail="GitHub PAT not configured.")
 
     try:
@@ -533,7 +553,7 @@ async def deploy_status():
             r = await client.get(
                 f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/build-ios.yml/runs?per_page=1",
                 headers={
-                    "Authorization": f"token {GITHUB_PAT}",
+                    "Authorization": f"token {pat}",
                     "Accept": "application/vnd.github.v3+json",
                 },
             )
