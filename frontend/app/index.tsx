@@ -385,19 +385,21 @@ export default function JarvisChat() {
     loadConversation();
   }, []);
 
-  // Unified tool action processor with depth limit to prevent infinite loops
+  // Unified tool action processor — no hard limit, Jarvis decides when to stop
+  // Uses proper tool message format so the LLM knows it called a tool
   const processToolAction = useCallback(async (
     toolCall: ToolCall,
+    assistantToolMessage: any,  // Raw assistant message with tool_calls for history
     currentMessages: Message[],
     depth: number = 0,
   ) => {
-    const MAX_TOOL_DEPTH = 3;
-    if (depth >= MAX_TOOL_DEPTH) {
+    const SAFETY_LIMIT = 10;  // Emergency brake only — Jarvis should self-terminate before this
+    if (depth >= SAFETY_LIMIT) {
       setMessages(prev => {
         const updated = [...prev];
         const last = updated.length - 1;
         if (updated[last]?.role === 'assistant') {
-          updated[last] = { ...updated[last], content: 'Tool chain limit reached. What would you like me to do next?' };
+          updated[last] = { ...updated[last], content: 'I\'ve hit my safety limit of 10 consecutive tool calls. Let me stop here and summarise what I\'ve done so far, sir.' };
         }
         return updated;
       });
@@ -411,7 +413,6 @@ export default function JarvisChat() {
       // Voice actions: trigger TTS directly, show the text as a normal message
       if (category === 'Voice' && result) {
         speakText(result, Date.now().toString());
-        // Update the last assistant message to show the spoken text
         setMessages(prev => {
           const updated = [...prev];
           const last = updated.length - 1;
@@ -421,48 +422,74 @@ export default function JarvisChat() {
           return updated;
         });
         await saveMessage('assistant', result);
+        setIsGenerating(false);
         return;
       }
 
-      // Show the tool result as a system message
+      // Show the tool result
       const toolResultMsg: Message = {
         id: Date.now().toString() + '_tool',
         role: 'assistant',
-        content: `[${category}: ${displayName}]\n${result}`,
+        content: `[${category}: ${displayName}] ${depth > 0 ? `(step ${depth + 1})` : ''}\n${result}`,
       };
       setMessages(prev => [...prev, toolResultMsg]);
 
-      // Send the result back to Jarvis so it can formulate a follow-up
+      // Prepare placeholder for Jarvis's follow-up
       const followUpMsg: Message = { id: (Date.now() + 2).toString(), role: 'assistant', content: '' };
       setMessages(prev => [...prev, followUpMsg]);
       setIsGenerating(true);
 
-      const history = [
-        ...currentMessages.map(m => ({ role: m.role, content: m.content })),
-        { role: 'user' as const, content: `[Tool result for ${displayName}]: ${result}` },
-      ].slice(-50);
+      // Build history with PROPER tool calling format
+      // This is the key fix: include the assistant's tool_call message and the tool result
+      // using the correct "tool" role so the LLM knows IT called the tool
+      const historyMessages: any[] = currentMessages
+        .filter(m => m.role === 'user' || m.role === 'assistant')
+        .slice(-40)
+        .map(m => ({ role: m.role, content: m.content || '' }));
+
+      // Add the assistant message that contained the tool_call
+      if (assistantToolMessage) {
+        historyMessages.push(assistantToolMessage);
+      }
+
+      // Add the tool result using proper "tool" role format
+      historyMessages.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        name: toolCall.name,
+        content: result,
+      });
 
       const res = await fetch(`${BACKEND_URL}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: history }),
+        body: JSON.stringify({ messages: historyMessages }),
       });
       const data = await res.json();
 
       if (data.tool_call) {
-        // Another tool call in the chain
+        // Another tool call in the chain — show reasoning
         const chainMsgs = [...currentMessages, toolResultMsg];
+        const reasoningText = data.content
+          ? `${data.content}\n\nExecuting: ${data.tool_call.name}...`
+          : `Executing: ${data.tool_call.name}...`;
         setMessages(prev => {
           const updated = [...prev];
           const last = updated.length - 1;
           if (updated[last]?.role === 'assistant' && !updated[last].content) {
-            updated[last] = { ...updated[last], content: `Executing: ${data.tool_call.name}...` };
+            updated[last] = { ...updated[last], content: reasoningText };
           }
           return updated;
         });
-        processToolAction(data.tool_call as ToolCall, chainMsgs, depth + 1);
+        // Continue the chain with the new assistant_tool_message for proper context
+        processToolAction(
+          data.tool_call as ToolCall,
+          data.assistant_tool_message || null,
+          chainMsgs,
+          depth + 1,
+        );
       } else {
-        // Normal text follow-up
+        // Normal text follow-up — Jarvis decided to stop
         const followUpText = data.content || '';
         setMessages(prev => {
           const updated = [...prev];
@@ -475,10 +502,18 @@ export default function JarvisChat() {
         if (followUpText) {
           await saveMessage('assistant', followUpText);
         }
+        setIsGenerating(false);
       }
     } catch (err) {
       console.log('Tool action error:', err);
-    } finally {
+      setMessages(prev => {
+        const updated = [...prev];
+        const last = updated.length - 1;
+        if (updated[last]?.role === 'assistant') {
+          updated[last] = { ...updated[last], content: `Tool execution failed: ${err}. What would you like me to try instead, sir?` };
+        }
+        return updated;
+      });
       setIsGenerating(false);
     }
   }, [speakText, saveMessage]);
@@ -557,18 +592,25 @@ export default function JarvisChat() {
 
       // Parse the response — check for native tool_call field
       if (data.tool_call) {
-        // Native tool call from LLM — show status, then execute
+        // Native tool call from LLM — show status + any reasoning text, then execute
         const currentMsgs = [...messages, userMsg, assistantMsg];
+        const reasoningText = data.content
+          ? `${data.content}\n\nExecuting: ${data.tool_call.name}...`
+          : `Executing: ${data.tool_call.name}...`;
         setMessages(prev => {
           const updated = [...prev];
           const last = updated.length - 1;
           if (updated[last]?.role === 'assistant') {
-            updated[last] = { ...updated[last], content: `Executing: ${data.tool_call.name}...` };
+            updated[last] = { ...updated[last], content: reasoningText };
           }
           return updated;
         });
-        // Execute tool OUTSIDE setState
-        processToolAction(data.tool_call as ToolCall, currentMsgs);
+        // Execute tool OUTSIDE setState — pass assistant_tool_message for proper history
+        processToolAction(
+          data.tool_call as ToolCall,
+          data.assistant_tool_message || null,
+          currentMsgs,
+        );
       } else {
         // Normal text reply
         const responseText = data.content || 'Empty response from Jarvis.';

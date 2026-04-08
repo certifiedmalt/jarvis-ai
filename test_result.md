@@ -214,6 +214,21 @@ metadata:
           agent: "testing"
           comment: "✅ VERIFIED: System prompt working correctly. When asked 'What tools do you have? Tell me about your capabilities.', Jarvis returns text description with tool_call: null (not executing tools). Response includes detailed list of all available tools and capabilities as expected."
 
+  - task: "Proper tool calling format (tool role messages)"
+    implemented: true
+    working: true
+    file: "server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "MAJOR FIX for tool hallucination: (1) ChatMessage model now supports role=tool with tool_call_id/name, and role=assistant with tool_calls array. (2) Backend chat endpoint properly builds messages for Together.ai including tool role messages. (3) Backend returns assistant_tool_message field with raw tool_call for history continuity. (4) Frontend processToolAction rewritten to use proper tool message format. (5) Hard depth limit of 3 replaced with safety-only limit of 10. (6) System prompt has TOOL CHAINING reasoning instructions."
+        - working: true
+          agent: "testing"
+          comment: "✅ VERIFIED: All 5 tool calling format tests PASSED. (1) Tool-triggering chat correctly returns assistant_tool_message field with proper structure. (2) Tool role messages in conversation history are accepted without 422 validation errors. (3) Normal chat still works with tool_call: null. (4) Health check operational. (5) Asking about tools returns text description without executing tools. New tool calling format implementation is working perfectly."
+
 test_plan:
   current_focus: []
   stuck_tasks: []
@@ -226,6 +241,6 @@ agent_communication:
     - agent: "testing"
       message: "✅ BACKEND TESTING COMPLETE: Health check and main chat endpoint working perfectly with Together.ai Llama-3.3-70B. Chat returns proper JSON structure as requested. Conversation storage working. ❌ ISSUE FOUND: Streaming endpoint fails due to missing model parameter in request. MongoDB storage verified working. Binance shows expected location restriction error."
     - agent: "main"
-      message: "Fixed two bugs reported by user: (1) commitAndPush tool was mapped to writeFile with empty path causing Errno 21 on /app/. Added new POST /api/code/push endpoint that properly does git add -A + commit + push. Frontend jarvisParser.ts updated to call this endpoint directly. (2) System prompt updated so Jarvis describes tools when asked about them instead of executing them. Please test: POST /api/code/push with JSON body {message: 'test'}, POST /api/chat with messages asking 'what tools do you have' to verify it returns text not tool_call, and existing /api/chat, /api/health, /api/conversation endpoints still work."
+      message: "MAJOR FIX for tool hallucination: (1) ChatMessage model now supports role=tool with tool_call_id/name, and role=assistant with tool_calls array. (2) Backend chat endpoint properly builds messages for Together.ai including tool role messages. (3) Backend returns assistant_tool_message field with raw tool_call for history continuity. (4) Frontend processToolAction rewritten to use proper tool message format. (5) Hard depth limit of 3 replaced with safety-only limit of 10. (6) System prompt has TOOL CHAINING reasoning instructions. Test: POST /api/chat with tool-triggering message, verify response includes assistant_tool_message. Then test sending a follow-up with role=tool message in history."
     - agent: "testing"
-      message: "✅ ALL BACKEND TESTS PASSED: Comprehensive testing completed on all 6 endpoints. (1) POST /api/code/push working perfectly - returns status 'pushed' with successful git output. (2) Chat tools description working correctly - returns text description with tool_call: null when asked about capabilities. (3) All existing endpoints (health, chat, conversation) working as expected. Both new bug fixes verified working correctly. Backend is fully functional."
+      message: "✅ TOOL CALLING FORMAT TESTING COMPLETE: All 5 comprehensive tests passed successfully. The new proper tool calling format is working perfectly - tool-triggering messages return assistant_tool_message, tool role messages are accepted in conversation history, normal chat works, health check operational, and asking about tools returns descriptions without execution. Backend implementation is solid and ready for production use."

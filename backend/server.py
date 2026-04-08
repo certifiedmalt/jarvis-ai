@@ -69,6 +69,13 @@ CRITICAL — WHEN TO USE vs DESCRIBE TOOLS:
 - If the user asks ABOUT your tools, capabilities, or what you can do (e.g. "what tools do you have?", "tell me about your tools", "what can you do?"), respond with a TEXT DESCRIPTION of your capabilities. Do NOT call any tools. Simply list and explain them in plain English.
 - When in doubt, ask the user whether they want you to describe or execute.
 
+TOOL CHAINING — THINK OUT LOUD:
+- When a task requires multiple tool calls (e.g. read file → edit → push), you may chain tools automatically.
+- Before each tool call, briefly explain your reasoning in your text response. For example: "Let me read the file first to see what we're working with." then call readCodeFile.
+- After receiving a tool result, decide whether you need another tool or if the task is complete.
+- When the task is done, summarise what you accomplished. Do NOT call another tool if the job is finished.
+- You are allowed up to 10 consecutive tool calls per user request. Use only as many as needed.
+
 OPERATING RULES:
 1. Only call a tool when the user explicitly wants you to perform the action, not when they are asking about your capabilities.
 2. If you need to inspect code before editing, use readCodeFile first.
@@ -295,7 +302,10 @@ class StatusCheckCreate(BaseModel):
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[str] = None
+    tool_calls: Optional[list] = None  # For assistant messages that made tool calls
+    tool_call_id: Optional[str] = None  # For tool result messages
+    name: Optional[str] = None  # Tool name for tool result messages
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
@@ -308,6 +318,7 @@ class ChatResponse(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     content: Optional[str] = None
     tool_call: Optional[dict] = None
+    assistant_tool_message: Optional[dict] = None  # Raw assistant message for tool chain continuity
     model: str
     usage: Optional[dict] = None
 
@@ -373,10 +384,27 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail="LLM not configured")
 
     try:
-        # Build messages with system prompt
+        # Build messages with system prompt, supporting all message types
         messages = [{"role": "system", "content": JARVIS_SYSTEM_PROMPT}]
         for msg in request.messages:
-            messages.append({"role": msg.role, "content": msg.content})
+            if msg.role == "tool" and msg.tool_call_id:
+                # Tool result message — proper format for continuing after tool execution
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": msg.tool_call_id,
+                    "name": msg.name or "",
+                    "content": msg.content or "",
+                })
+            elif msg.role == "assistant" and msg.tool_calls:
+                # Assistant message that contained tool calls — needed for context
+                messages.append({
+                    "role": "assistant",
+                    "tool_calls": msg.tool_calls,
+                    "content": msg.content or "",
+                })
+            else:
+                # Regular user/assistant text message
+                messages.append({"role": msg.role, "content": msg.content or ""})
 
         model_to_use = request.model or DEFAULT_MODEL
 
@@ -411,11 +439,28 @@ async def chat(request: ChatRequest):
                 "arguments": args,
             }
 
+            # Return the raw assistant tool_calls message so frontend can include it in history
+            assistant_tool_message = {
+                "role": "assistant",
+                "content": choice.message.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments or "{}",
+                        },
+                    }
+                ],
+            }
+
             logger.info(f"Tool call: {tc.function.name}({args})")
 
             return ChatResponse(
-                content=None,
+                content=choice.message.content,
                 tool_call=tool_call_data,
+                assistant_tool_message=assistant_tool_message,
                 model=model_to_use,
                 usage=usage,
             )
@@ -426,6 +471,7 @@ async def chat(request: ChatRequest):
             return ChatResponse(
                 content=content,
                 tool_call=None,
+                assistant_tool_message=None,
                 model=model_to_use,
                 usage=usage,
             )
