@@ -74,18 +74,20 @@ TOOL CHAINING — THINK OUT LOUD:
 - Before each tool call, briefly explain your reasoning in your text response. For example: "Let me read the file first to see what we're working with." then call readCodeFile.
 - After receiving a tool result, decide whether you need another tool or if the task is complete.
 - When the task is done, summarise what you accomplished. Do NOT call another tool if the job is finished.
-- You are allowed up to 10 consecutive tool calls per user request. Use only as many as needed.
+- You are allowed up to 12 consecutive tool calls per user request. Use only as many as needed.
 
 OPERATING RULES:
 1. Only call a tool when the user explicitly wants you to perform the action, not when they are asking about your capabilities.
 2. If you need to inspect code before editing, use readCodeFile first.
-3. For dangerous operations (writing code, deploying, pushing to GitHub), confirm with the user first.
-4. If the user asks for something you have no tool for, say so plainly.
-5. Be concise. No fluff. Assume the user is technical.
-6. When reporting tool results, summarise them clearly — don't dump raw data.
+3. For targeted edits (adding a function, fixing a bug), prefer patchCodeFile over writeCodeFile — it's faster and works on files of any size.
+4. Only use writeCodeFile when creating new files or rewriting small files entirely.
+5. For dangerous operations (writing code, deploying, pushing to GitHub), confirm with the user first.
+6. If the user asks for something you have no tool for, say so plainly.
+7. Be concise. No fluff. Assume the user is technical.
+8. When reporting tool results, summarise them clearly — don't dump raw data.
 
 CODE & DEPLOY RULES:
-1. Always readCodeFile before writeCodeFile — inspect before editing.
+1. Always readCodeFile before writeCodeFile or patchCodeFile — inspect before editing.
 2. Keep changes minimal and scoped.
 3. GitHub pushes to main auto-deploy the backend on Railway.
 4. iOS builds require triggerIOSBuild, then submitToTestFlight.
@@ -167,6 +169,48 @@ JARVIS_TOOLS = [
                     }
                 },
                 "required": ["message"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "patchCodeFile",
+            "description": "Edit a file by finding and replacing text, or inserting content after a specific line. Much more efficient than writeCodeFile for targeted changes — you only send the diff, not the entire file. Use 'replace' to swap existing code, or 'insert_after' to add new code at a line number.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to repo root, e.g. 'backend/server.py'"
+                    },
+                    "operation": {
+                        "type": "string",
+                        "enum": ["replace", "insert_after"],
+                        "description": "'replace' to find and replace text, 'insert_after' to insert content after a line number"
+                    },
+                    "find": {
+                        "type": "string",
+                        "description": "For 'replace' operation: the exact text to find in the file. Must match exactly including whitespace."
+                    },
+                    "replace_with": {
+                        "type": "string",
+                        "description": "For 'replace' operation: the text to replace 'find' with."
+                    },
+                    "line": {
+                        "type": "integer",
+                        "description": "For 'insert_after' operation: line number after which to insert content. Use 0 to insert at the beginning."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "For 'insert_after' operation: the content to insert."
+                    },
+                    "commit_message": {
+                        "type": "string",
+                        "description": "Git commit message describing the change"
+                    }
+                },
+                "required": ["path", "operation", "commit_message"]
             }
         }
     },
@@ -892,6 +936,84 @@ class CommitPushRequest(BaseModel):
     message: str = Field(default="JARVIS commit")
 
 
+class PatchCodeRequest(BaseModel):
+    path: str = Field(description="File path relative to repo root")
+    operation: str = Field(description="'replace' or 'insert_after'")
+    find: Optional[str] = Field(default=None, description="Text to find (for replace)")
+    replace_with: Optional[str] = Field(default=None, description="Replacement text (for replace)")
+    line: Optional[int] = Field(default=None, description="Line number to insert after (for insert_after)")
+    content: Optional[str] = Field(default=None, description="Content to insert (for insert_after)")
+    commit_message: str = Field(default="JARVIS patch")
+
+
+@api_router.post("/code/patch")
+async def patch_code_file(patch: PatchCodeRequest):
+    """Edit a file by find/replace or insert-after-line. Commits and pushes."""
+    full_path = os.path.join(REPO_DIR, patch.path)
+    if not os.path.exists(full_path):
+        raise HTTPException(status_code=404, detail=f"File not found: {patch.path}")
+
+    try:
+        with open(full_path, "r") as f:
+            original = f.read()
+
+        if patch.operation == "replace":
+            if not patch.find:
+                raise HTTPException(status_code=400, detail="'find' is required for replace operation")
+            if patch.find not in original:
+                # Return helpful error — show nearby lines if possible
+                return {
+                    "status": "not_found",
+                    "message": f"Could not find the specified text in {patch.path}. The text must match exactly including whitespace.",
+                    "file_lines": len(original.splitlines()),
+                }
+            replace_text = patch.replace_with if patch.replace_with is not None else ""
+            new_content = original.replace(patch.find, replace_text, 1)  # Replace first occurrence only
+
+        elif patch.operation == "insert_after":
+            if patch.line is None:
+                raise HTTPException(status_code=400, detail="'line' is required for insert_after operation")
+            if not patch.content:
+                raise HTTPException(status_code=400, detail="'content' is required for insert_after operation")
+            lines = original.splitlines(keepends=True)
+            if patch.line < 0 or patch.line > len(lines):
+                return {
+                    "status": "invalid_line",
+                    "message": f"Line {patch.line} is out of range. File has {len(lines)} lines.",
+                    "file_lines": len(lines),
+                }
+            insert_text = patch.content if patch.content.endswith("\n") else patch.content + "\n"
+            if patch.line == 0:
+                lines.insert(0, insert_text)
+            else:
+                lines.insert(patch.line, insert_text)
+            new_content = "".join(lines)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown operation: {patch.operation}. Use 'replace' or 'insert_after'.")
+
+        # Write the patched file
+        with open(full_path, "w") as f:
+            f.write(new_content)
+
+        # Git add, commit, push
+        result = subprocess.run(
+            f'cd {REPO_DIR} && git add "{patch.path}" && git commit -m "{patch.commit_message}" && git push origin main',
+            shell=True, capture_output=True, text=True, timeout=30
+        )
+        pushed = result.returncode == 0
+        return {
+            "status": "patched_and_pushed" if pushed else "patched_locally",
+            "file": patch.path,
+            "operation": patch.operation,
+            "message": patch.commit_message,
+            "git_output": (result.stdout + result.stderr)[-300:],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @api_router.post("/code/push")
 async def commit_and_push(request: CommitPushRequest):
     """Git add all changes, commit, and push to origin/main. Does NOT write any files."""
@@ -1012,4 +1134,4 @@ app.add_middleware(
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
-# v2.2.0 - File upload + Device integrations
+# v3.2.0 - Added patchCodeFile tool - File upload + Device integrations
