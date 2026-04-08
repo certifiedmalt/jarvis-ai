@@ -74,6 +74,11 @@ async function executeDeviceHandler(name: string, args: Record<string, any>): Pr
 // ── Code Handler ───────────────────────────────────────────────────
 
 async function executeCodeHandler(name: string, args: Record<string, any>): Promise<string> {
+  // commitAndPush is a dedicated operation — it does NOT write files
+  if (name === 'commitAndPush') {
+    return await executeCommitAndPush(args.message ?? 'JARVIS commit');
+  }
+
   const actionMap: Record<string, SelfUpdateAction> = {
     listRepoPaths: { action: 'list', dir_path: args.path ?? '' },
     readCodeFile: { action: 'read', file_path: args.path ?? '' },
@@ -83,15 +88,28 @@ async function executeCodeHandler(name: string, args: Record<string, any>): Prom
       content: args.content ?? '',
       commit_message: args.commit_message ?? 'JARVIS self-update',
     },
-    commitAndPush: {
-      action: 'write',
-      commit_message: args.message ?? 'JARVIS commit',
-    },
   };
 
   const updateAction = actionMap[name];
   if (!updateAction) return `Unknown Code function: ${name}`;
   return await executeSelfUpdate(updateAction);
+}
+
+async function executeCommitAndPush(message: string): Promise<string> {
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/code/push`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+    const data = await res.json();
+    if (!res.ok) return `Error pushing: ${data.detail || 'Unknown error'}`;
+    if (data.status === 'pushed') return `Pushed to GitHub: "${data.message}"`;
+    if (data.status === 'nothing_to_commit') return data.message || 'Nothing to commit.';
+    return `Git push ${data.status}: ${data.git_output || ''}`;
+  } catch (err: any) {
+    return `Push failed: ${err.message || String(err)}`;
+  }
 }
 
 // ── Deploy Handler (Server-side via GitHub Actions) ────────────────

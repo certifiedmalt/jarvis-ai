@@ -184,11 +184,35 @@ metadata:
   test_sequence: 1
   run_ui: false
 
+  - task: "commitAndPush tool - dedicated push endpoint"
+    implemented: true
+    working: "NA"
+    file: "server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Added POST /api/code/push endpoint. Previously commitAndPush was incorrectly routed through writeFile with empty path, causing Errno 21 (Is a directory) on /app/. Now has dedicated endpoint that does git add -A && git commit && git push."
+
+  - task: "System prompt - describe vs execute tools"
+    implemented: true
+    working: "NA"
+    file: "server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Updated JARVIS_SYSTEM_PROMPT to distinguish between user asking ABOUT tools vs asking to PERFORM actions. LLM should now describe capabilities in text when asked 'what can you do' instead of executing tools."
+
 test_plan:
   current_focus:
-    - "Chat streaming endpoint"
-  stuck_tasks:
-    - "Chat streaming endpoint"
+    - "commitAndPush tool - dedicated push endpoint"
+    - "System prompt - describe vs execute tools"
+  stuck_tasks: []
   test_all: false
   test_priority: "high_first"
 
@@ -197,3 +221,5 @@ agent_communication:
       message: "Implemented Jarvis backend with GPT-4o chat endpoints (regular + streaming) using direct OpenAI API key. Frontend rebuilt to remove broken MLC local LLM code and now calls backend /api/chat. Backend health and chat endpoints confirmed working via curl. Please test all backend endpoints thoroughly."
     - agent: "testing"
       message: "✅ BACKEND TESTING COMPLETE: Health check and main chat endpoint working perfectly with Together.ai Llama-3.3-70B. Chat returns proper JSON structure as requested. Conversation storage working. ❌ ISSUE FOUND: Streaming endpoint fails due to missing model parameter in request. MongoDB storage verified working. Binance shows expected location restriction error."
+    - agent: "main"
+      message: "Fixed two bugs reported by user: (1) commitAndPush tool was mapped to writeFile with empty path causing Errno 21 on /app/. Added new POST /api/code/push endpoint that properly does git add -A + commit + push. Frontend jarvisParser.ts updated to call this endpoint directly. (2) System prompt updated so Jarvis describes tools when asked about them instead of executing them. Please test: POST /api/code/push with JSON body {message: 'test'}, POST /api/chat with messages asking 'what tools do you have' to verify it returns text not tool_call, and existing /api/chat, /api/health, /api/conversation endpoints still work."

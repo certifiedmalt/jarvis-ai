@@ -62,10 +62,15 @@ JARVIS_SYSTEM_PROMPT = """You are Jarvis, the autonomous personal assistant insi
 
 You have a dry British wit, occasionally address the user as "sir", and are direct, technically competent, and reliable. You prioritise safety, clarity, and reliability above creativity.
 
-You have access to tools for managing code, deploying iOS builds, interacting with the user's device, and speaking aloud. Use them when appropriate — do not describe what you would do, just do it.
+You have access to tools for managing code, deploying iOS builds, interacting with the user's device, and speaking aloud.
+
+CRITICAL — WHEN TO USE vs DESCRIBE TOOLS:
+- If the user asks you to PERFORM an action (e.g. "read my calendar", "push the code", "get my location"), USE the tool.
+- If the user asks ABOUT your tools, capabilities, or what you can do (e.g. "what tools do you have?", "tell me about your tools", "what can you do?"), respond with a TEXT DESCRIPTION of your capabilities. Do NOT call any tools. Simply list and explain them in plain English.
+- When in doubt, ask the user whether they want you to describe or execute.
 
 OPERATING RULES:
-1. When the user asks you to do something you have a tool for, USE THE TOOL. Do not describe the action — execute it.
+1. Only call a tool when the user explicitly wants you to perform the action, not when they are asking about your capabilities.
 2. If you need to inspect code before editing, use readCodeFile first.
 3. For dangerous operations (writing code, deploying, pushing to GitHub), confirm with the user first.
 4. If the user asks for something you have no tool for, say so plainly.
@@ -833,6 +838,31 @@ async def write_code_file(update: CodeUpdate):
             "message": update.commit_message,
             "git_output": (result.stdout + result.stderr)[-300:],
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class CommitPushRequest(BaseModel):
+    message: str = Field(default="JARVIS commit")
+
+
+@api_router.post("/code/push")
+async def commit_and_push(request: CommitPushRequest):
+    """Git add all changes, commit, and push to origin/main. Does NOT write any files."""
+    try:
+        result = subprocess.run(
+            f'cd {REPO_DIR} && git add -A && git commit -m "{request.message}" && git push origin main',
+            shell=True, capture_output=True, text=True, timeout=30
+        )
+        output = (result.stdout + result.stderr).strip()
+        if result.returncode == 0:
+            return {"status": "pushed", "message": request.message, "git_output": output[-500:]}
+        elif "nothing to commit" in output:
+            return {"status": "nothing_to_commit", "message": "No changes to commit.", "git_output": output[-500:]}
+        else:
+            return {"status": "failed", "message": request.message, "git_output": output[-500:]}
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "message": "Git push timed out."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
 Jarvis Backend API Testing Script
-Tests the chat endpoint to verify structured JSON responses from Together.ai (Llama-3.3-70B)
+Tests all backend endpoints including:
+- Health check
+- Chat endpoint with normal messages and tool requests
+- New code push endpoint
+- Chat endpoint asking about tools (should return text, not tool_call)
+- Conversation endpoint
 """
 
 import requests
@@ -181,6 +186,105 @@ def test_tool_triggering_chat():
         print(f"❌ Tool-triggering chat error: {e}")
         return False, str(e)
 
+def test_code_push_endpoint():
+    """Test 4: POST /api/code/push - New endpoint for git commit and push"""
+    print_test_header("Code Push Endpoint")
+    
+    payload = {
+        "message": "test commit"
+    }
+    
+    try:
+        response = requests.post(
+            f"{API_BASE}/code/push", 
+            json=payload, 
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+        
+        response_data = print_response_details(response, "Code Push")
+        
+        if response.status_code == 200 and response_data:
+            status = response_data.get("status")
+            if status in ["pushed", "nothing_to_commit", "failed"]:
+                print(f"✅ Code push endpoint working - Status: {status}")
+                return True, f"Code push endpoint working with status: {status}"
+            else:
+                print(f"❌ Unexpected status: {status}")
+                return False, f"Unexpected status: {status}"
+        else:
+            print(f"❌ Code push failed")
+            return False, f"HTTP {response.status_code}"
+            
+    except Exception as e:
+        print(f"❌ Code push error: {e}")
+        return False, str(e)
+
+def test_chat_tools_description():
+    """Test 5: Chat asking about tools - should return TEXT description, NOT tool_call"""
+    print_test_header("Chat Tools Description")
+    
+    payload = {
+        "messages": [{"role": "user", "content": "What tools do you have? Tell me about your capabilities."}]
+    }
+    
+    try:
+        response = requests.post(
+            f"{API_BASE}/chat", 
+            json=payload, 
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+        
+        response_data = print_response_details(response, "Chat Tools Description")
+        
+        if response.status_code == 200 and response_data:
+            # Check that tool_call is null
+            tool_call = response_data.get("tool_call")
+            content = response_data.get("content")
+            
+            if tool_call is not None:
+                print(f"❌ BUG: tool_call should be null but got: {tool_call}")
+                return False, "BUG: LLM is executing tools instead of describing them"
+            
+            if content and isinstance(content, str) and len(content) > 10:
+                print(f"✅ Chat tools description working - Got text description")
+                print(f"   Content preview: {content[:100]}...")
+                return True, "Chat tools description working - returns text description"
+            else:
+                print(f"❌ No valid content in response")
+                return False, "No valid content in response"
+        else:
+            print(f"❌ Chat tools description failed")
+            return False, f"HTTP {response.status_code}"
+            
+    except Exception as e:
+        print(f"❌ Chat tools description error: {e}")
+        return False, str(e)
+
+def test_conversation_endpoint():
+    """Test 6: GET /api/conversation - Should return messages array"""
+    print_test_header("Conversation Endpoint")
+    
+    try:
+        response = requests.get(f"{API_BASE}/conversation", timeout=10)
+        response_data = print_response_details(response, "Conversation")
+        
+        if response.status_code == 200 and response_data:
+            if "messages" in response_data and isinstance(response_data["messages"], list):
+                print(f"✅ Conversation endpoint working - Got messages array")
+                return True, "Conversation endpoint working"
+            else:
+                print(f"❌ Missing or invalid messages array")
+                return False, "Missing or invalid messages array"
+        else:
+            print(f"❌ Conversation endpoint failed")
+            return False, f"HTTP {response.status_code}"
+            
+    except Exception as e:
+        print(f"❌ Conversation endpoint error: {e}")
+        return False, str(e)
+
 def main():
     """Run all tests and provide summary"""
     print(f"Jarvis Backend API Testing")
@@ -192,6 +296,9 @@ def main():
         ("Health Check", test_health_check),
         ("Normal Chat", test_normal_chat),
         ("Tool-Triggering Chat", test_tool_triggering_chat),
+        ("Code Push Endpoint", test_code_push_endpoint),
+        ("Chat Tools Description", test_chat_tools_description),
+        ("Conversation Endpoint", test_conversation_endpoint),
     ]
     
     results = []
