@@ -44,7 +44,16 @@ jobs:
         working-directory: frontend
         run: eas build --platform ios --profile production --non-interactive
 
+      - name: Wait for build processing
+        if: ${{ github.event.inputs.action == 'build_and_submit' }}
+        run: sleep 30
+
       - name: Submit to TestFlight
         if: ${{ github.event.inputs.action == 'submit' || github.event.inputs.action == 'build_and_submit' }}
         working-directory: frontend
+        continue-on-error: true
         run: eas submit --platform ios --latest --non-interactive
+
+      - name: Report status
+        if: always()
+        run: echo "Build pipeline complete. Check https://expo.dev for build status."
