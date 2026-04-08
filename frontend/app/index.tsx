@@ -52,6 +52,8 @@ export default function JarvisChat() {
   const [autoRead, setAutoRead] = useState(true);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
+  const [toolDepth, setToolDepth] = useState(0);  // Track current chain depth for warnings
+  const abortRef = useRef(false);  // Abort flag for stopping tool chains
   const scrollViewRef = useRef<ScrollView>(null);
 
   const [modelName, setModelName] = useState('Connecting...');
@@ -385,6 +387,27 @@ export default function JarvisChat() {
     loadConversation();
   }, []);
 
+  // Stop button handler — abort the current tool chain
+  const handleStop = useCallback(() => {
+    abortRef.current = true;
+    setIsGenerating(false);
+    setToolDepth(0);
+    setMessages(prev => {
+      const updated = [...prev];
+      const last = updated.length - 1;
+      if (updated[last]?.role === 'assistant' && !updated[last].content) {
+        updated[last] = { ...updated[last], content: 'Stopped by user.' };
+      } else {
+        updated.push({
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: 'Stopped. What would you like me to do instead, sir?',
+        });
+      }
+      return updated;
+    });
+  }, []);
+
   // Unified tool action processor — no hard limit, Jarvis decides when to stop
   // Uses proper tool message format so the LLM knows it called a tool
   const processToolAction = useCallback(async (
@@ -393,6 +416,16 @@ export default function JarvisChat() {
     currentMessages: Message[],
     depth: number = 0,
   ) => {
+    // Check if user hit Stop
+    if (abortRef.current) {
+      abortRef.current = false;
+      setToolDepth(0);
+      setIsGenerating(false);
+      return;
+    }
+
+    setToolDepth(depth + 1);
+
     const SAFETY_LIMIT = 10;  // Emergency brake only — Jarvis should self-terminate before this
     if (depth >= SAFETY_LIMIT) {
       setMessages(prev => {
@@ -438,6 +471,14 @@ export default function JarvisChat() {
       const followUpMsg: Message = { id: (Date.now() + 2).toString(), role: 'assistant', content: '' };
       setMessages(prev => [...prev, followUpMsg]);
       setIsGenerating(true);
+
+      // Check abort before making another API call
+      if (abortRef.current) {
+        abortRef.current = false;
+        setToolDepth(0);
+        setIsGenerating(false);
+        return;
+      }
 
       // Build history with PROPER tool calling format
       // This is the key fix: include the assistant's tool_call message and the tool result
@@ -502,6 +543,7 @@ export default function JarvisChat() {
         if (followUpText) {
           await saveMessage('assistant', followUpText);
         }
+        setToolDepth(0);
         setIsGenerating(false);
       }
     } catch (err) {
@@ -514,6 +556,7 @@ export default function JarvisChat() {
         }
         return updated;
       });
+      setToolDepth(0);
       setIsGenerating(false);
     }
   }, [speakText, saveMessage]);
@@ -527,6 +570,8 @@ export default function JarvisChat() {
   const sendMessage = useCallback(async () => {
     if ((!inputText.trim() && !attachedFile) || isGenerating) return;
     Keyboard.dismiss();
+    abortRef.current = false;  // Reset abort flag for new message
+    setToolDepth(0);
 
     const msgContent = inputText.trim() || (attachedFile ? `Analyze this file: ${attachedFile.name}` : '');
     const userMsg: Message = {
@@ -713,6 +758,16 @@ export default function JarvisChat() {
       </ScrollView>
 
       <View style={[styles.inputArea, { paddingBottom: Math.max(insets.bottom, 10) + 8 }]}>
+        {/* Loop warning banner */}
+        {toolDepth >= 4 && isGenerating && (
+          <View style={styles.loopWarning}>
+            <Text style={styles.loopWarningText}>
+              {toolDepth >= 7
+                ? `Jarvis has chained ${toolDepth} tools — possible loop. Consider stopping.`
+                : `Jarvis is on tool step ${toolDepth}...`}
+            </Text>
+          </View>
+        )}
         {attachedFile && (
           <View style={styles.filePreview}>
             {attachedFile.mimeType.startsWith('image/') ? (
@@ -757,12 +812,16 @@ export default function JarvisChat() {
             onPress={sendMessage}
             disabled={(!inputText.trim() && !attachedFile) || isGenerating}
           >
-            {isGenerating ? (
-              <ActivityIndicator size="small" color="#FFF" />
-            ) : (
-              <Text style={styles.sendIcon}>{'>'}</Text>
-            )}
+            <Text style={styles.sendIcon}>{'>'}</Text>
           </TouchableOpacity>
+          {isGenerating && (
+            <TouchableOpacity
+              style={styles.stopBtn}
+              onPress={handleStop}
+            >
+              <Text style={styles.stopIcon}>{'■'}</Text>
+            </TouchableOpacity>
+          )}
         </View>
       </View>
     </KeyboardAvoidingView>
@@ -848,4 +907,14 @@ const styles = StyleSheet.create({
   },
   sendBtnOff: { backgroundColor: '#1A1A25' },
   sendIcon: { fontSize: 20, fontWeight: '700', color: '#FFF' },
+  stopBtn: {
+    width: 44, height: 44,
+    borderRadius: 22, backgroundColor: '#FF4444', alignItems: 'center', justifyContent: 'center',
+  },
+  stopIcon: { fontSize: 16, fontWeight: '700', color: '#FFF' },
+  loopWarning: {
+    backgroundColor: '#FF444420', borderWidth: 1, borderColor: '#FF444460',
+    borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, marginBottom: 8,
+  },
+  loopWarningText: { fontSize: 12, color: '#FF8888', textAlign: 'center' },
 });
