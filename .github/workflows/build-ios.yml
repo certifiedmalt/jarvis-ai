@@ -47,7 +47,7 @@ jobs:
       - name: Submit to TestFlight
         if: ${{ github.event.inputs.action == 'submit' || github.event.inputs.action == 'build_and_submit' }}
         working-directory: frontend
-        run: eas submit --platform ios --latest --non-interactive
+        run: eas submit --platform ios --latest --non-interactive --verbose
 
       - name: Report status
         if: always()
