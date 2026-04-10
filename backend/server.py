@@ -1,5 +1,4 @@
 from fastapi import FastAPI, APIRouter, HTTPException
-# Patched by test
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -1135,4 +1134,4 @@ app.add_middleware(
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
-# v3.2.0 - Added patchCodeFile tool - File upload + Device integrations
+# v3.2.0 - patchCodeFile + proper tool calling + stop button
