@@ -39,13 +39,13 @@ jobs:
         working-directory: frontend
         run: npm install
 
-      - name: Run EAS Build (iOS) and wait for completion
+      - name: Run EAS Build (iOS)
         if: ${{ github.event.inputs.action == 'build' || github.event.inputs.action == 'build_and_submit' }}
         working-directory: frontend
-        run: eas build --platform ios --profile production --non-interactive --auto-submit
+        run: eas build --platform ios --profile production --non-interactive
 
-      - name: Submit Latest Build (manual submit only)
-        if: ${{ github.event.inputs.action == 'submit' }}
+      - name: Submit to TestFlight
+        if: ${{ github.event.inputs.action == 'submit' || github.event.inputs.action == 'build_and_submit' }}
         working-directory: frontend
         run: eas submit --platform ios --latest --non-interactive
 
