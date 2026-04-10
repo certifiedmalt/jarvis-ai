@@ -37,12 +37,12 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: frontend
-        run: yarn install --frozen-lockfile
+        run: npm install
 
-      - name: Run EAS Build + Auto Submit (iOS)
+      - name: Run EAS Build (iOS) and wait for completion
         if: ${{ github.event.inputs.action == 'build' || github.event.inputs.action == 'build_and_submit' }}
         working-directory: frontend
-        run: eas build --platform ios --profile production --auto-submit --non-interactive
+        run: eas build --platform ios --profile production --non-interactive --auto-submit
 
       - name: Submit Latest Build (manual submit only)
         if: ${{ github.event.inputs.action == 'submit' }}
