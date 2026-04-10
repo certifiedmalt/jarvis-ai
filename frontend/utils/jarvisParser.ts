@@ -36,7 +36,7 @@ export async function executeToolAction(
   }
 
   // ── Code Actions ─────────────────────────────────────────────
-  if (['listRepoPaths', 'readCodeFile', 'writeCodeFile', 'commitAndPush'].includes(name)) {
+  if (['listRepoPaths', 'readCodeFile', 'writeCodeFile', 'patchCodeFile', 'commitAndPush'].includes(name)) {
     const result = await executeCodeHandler(name, args);
     return { result, category: 'Code', displayName: name };
   }
