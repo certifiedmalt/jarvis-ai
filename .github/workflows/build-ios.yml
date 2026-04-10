@@ -47,15 +47,7 @@ jobs:
       - name: Submit to TestFlight
         if: ${{ github.event.inputs.action == 'submit' || github.event.inputs.action == 'build_and_submit' }}
         working-directory: frontend
-        env:
-          DEBUG: 'eas:*'
-          EAS_NO_VCS: '1'
-        run: |
-          echo "=== Listing recent builds ==="
-          eas build:list --platform ios --limit 3 --non-interactive || true
-          echo "=== Attempting submit ==="
-          eas submit --platform ios --latest --non-interactive --verbose 2>&1 || true
-          echo "=== Submit step finished ==="
+        run: eas submit --platform ios --latest --non-interactive --verbose
 
       - name: Report status
         if: always()
