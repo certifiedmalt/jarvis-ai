@@ -68,7 +68,8 @@
         {
           "locationWhenInUsePermission": "Jarvis uses your location for context-aware help."
         }
-      ]
+      ],
+      "expo-audio"
     ],
     "experiments": {
       "typedRoutes": true

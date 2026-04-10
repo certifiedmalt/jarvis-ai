@@ -20,7 +20,7 @@ import * as FileSystem from 'expo-file-system';
 import * as Speech from 'expo-speech';
 import * as ImagePicker from 'expo-image-picker';
 import * as Clipboard from 'expo-clipboard';
-import { Audio } from 'expo-av';
+import { useAudioPlayer, setAudioModeAsync as setAudioMode } from 'expo-audio';
 
 const ELEVENLABS_API_KEY = 'sk_8dd9778f172097e391decb1b8ce43845d40fcbdcbf9cb57d';
 const ELEVENLABS_VOICE_ID = 'WgsC88oU7oxSBORk8LGd'; // User's custom Jarvis 1 voice
@@ -81,15 +81,11 @@ export default function JarvisChat() {
   }, [messages]);
 
   // TTS functions - ElevenLabs first, iOS TTS fallback
-  const soundRef = useRef<Audio.Sound | null>(null);
+  const audioPlayer = useAudioPlayer(null);
 
   const speakText = useCallback(async (text: string, msgId: string) => {
     // Stop any current speech
-    if (soundRef.current) {
-      await soundRef.current.stopAsync().catch(() => {});
-      await soundRef.current.unloadAsync().catch(() => {});
-      soundRef.current = null;
-    }
+    try { audioPlayer.pause(); } catch (_) {}
     const speaking = await Speech.isSpeakingAsync();
     if (speaking) await Speech.stop();
 
@@ -109,10 +105,7 @@ export default function JarvisChat() {
 
     // Try ElevenLabs first (called from phone directly)
     try {
-      await Audio.setAudioModeAsync({
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: false,
-      });
+      await setAudioMode({ playsInSilentMode: true });
 
       const response = await fetch(
         `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
@@ -152,20 +145,17 @@ export default function JarvisChat() {
           encoding: FileSystem.EncodingType.Base64,
         });
 
-        const { sound } = await Audio.Sound.createAsync(
-          { uri: fileUri },
-          { shouldPlay: true }
-        );
-        soundRef.current = sound;
+        audioPlayer.replace({ uri: fileUri });
+        audioPlayer.play();
 
-        sound.setOnPlaybackStatusUpdate((status) => {
-          if (status.isLoaded && status.didJustFinish) {
+        // Poll for playback completion
+        const checkInterval = setInterval(() => {
+          if (!audioPlayer.playing) {
+            clearInterval(checkInterval);
             setIsSpeaking(false);
             setSpeakingMsgId(null);
-            sound.unloadAsync().catch(() => {});
-            soundRef.current = null;
           }
-        });
+        }, 500);
         return; // ElevenLabs worked
       }
     } catch (e) {
@@ -196,18 +186,14 @@ export default function JarvisChat() {
     };
     if (voiceId) options.voice = voiceId;
     Speech.speak(cleanText, options);
-  }, []);
+  }, [audioPlayer]);
 
   const stopSpeaking = useCallback(async () => {
-    if (soundRef.current) {
-      await soundRef.current.stopAsync().catch(() => {});
-      await soundRef.current.unloadAsync().catch(() => {});
-      soundRef.current = null;
-    }
+    try { audioPlayer.pause(); } catch (_) {}
     await Speech.stop();
     setIsSpeaking(false);
     setSpeakingMsgId(null);
-  }, []);
+  }, [audioPlayer]);
 
   // Auto-read new assistant messages
   useEffect(() => {
