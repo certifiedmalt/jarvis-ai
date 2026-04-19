@@ -11,6 +11,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.certifiedmalt.jarvis",
+      "buildNumber": "3",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
         "NSContactsUsageDescription": "Find and manage contacts through Jarvis",
@@ -18,8 +19,7 @@
         "NSLocationWhenInUseUsageDescription": "Provide location-aware assistance",
         "NSPhotoLibraryUsageDescription": "Share photos and files with Jarvis",
         "NSCameraUsageDescription": "Capture photos and videos for Jarvis",
-        "NSMicrophoneUsageDescription": "Record audio and video for Jarvis",
-        "ITSAppUsesNonExemptEncryption": false
+        "NSMicrophoneUsageDescription": "Record audio and video for Jarvis"
       }
     },
     "android": {
