@@ -16,9 +16,11 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Constants from 'expo-constants';
 
 // ─── Config ─────────────────────────────────────────────────────────
-const BACKEND_URL = Constants.expoConfig?.extra?.EXPO_PUBLIC_BACKEND_URL
-  || process.env.EXPO_PUBLIC_BACKEND_URL
-  || '';
+// Dev: uses EXPO_PUBLIC_BACKEND_URL from .env (Emergent preview)
+// Prod: falls back to Railway
+const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL
+  || Constants.expoConfig?.extra?.EXPO_PUBLIC_BACKEND_URL
+  || 'https://jarvis-backend-production-a86c.up.railway.app';
 
 // ─── Types ──────────────────────────────────────────────────────────
 type Message = {
