@@ -241,6 +241,18 @@ metadata:
           agent: "testing"
           comment: "✅ VERIFIED: NEW patchCodeFile endpoint (/api/code/patch) working perfectly. All 6 comprehensive tests PASSED: (1) Replace operation successfully found '# v2.2.0' and replaced with '# v3.2.0 - Added patchCodeFile tool', returned status 'patched_and_pushed' with git commit/push. (2) Text not found correctly returned status 'not_found' with helpful message. (3) Insert after line operation successfully inserted content after line 1, returned 'patched_and_pushed'. (4) File not found correctly returned 404 status for non-existent file. (5) Health check still working (status=online, llm_provider=together). (6) Chat endpoint still working with proper JSON response. The patchCodeFile tool is production-ready and handles all edge cases correctly."
 
+  - task: "Standing Orders (Trust Boundaries) feature"
+    implemented: true
+    working: true
+    file: "server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: true
+          agent: "testing"
+          comment: "✅ VERIFIED: Standing Orders feature working perfectly. All 8 comprehensive tests PASSED: (1) GET /api/standing-orders returns empty orders initially. (2) POST /api/standing-orders?category=code_write&granted=true successfully grants permission. (3) GET /api/standing-orders correctly shows {code_write: true}. (4) POST /api/standing-orders?category=deploy&granted=true grants second permission. (5) GET /api/standing-orders shows both {code_write: true, deploy: true}. (6) POST /api/standing-orders?category=code_write&granted=false successfully revokes permission. (7) Chat endpoint dynamically includes active standing orders in system prompt - LLM correctly responds 'You have an active standing order for the deploy category'. (8) Health check operational. The trust boundaries system is production-ready with proper MongoDB persistence and dynamic system prompt injection."
+
 test_plan:
   current_focus: []
   stuck_tasks: []
@@ -258,3 +270,5 @@ agent_communication:
       message: "✅ TOOL CALLING FORMAT TESTING COMPLETE: All 5 comprehensive tests passed successfully. The new proper tool calling format is working perfectly - tool-triggering messages return assistant_tool_message, tool role messages are accepted in conversation history, normal chat works, health check operational, and asking about tools returns descriptions without execution. Backend implementation is solid and ready for production use."
     - agent: "testing"
       message: "✅ PATCHCODEFILE ENDPOINT TESTING COMPLETE: All 6 comprehensive tests for the new /api/code/patch endpoint PASSED successfully. Replace operations work correctly (found and replaced '# v2.2.0' with '# v3.2.0 - Added patchCodeFile tool'), text-not-found scenarios return proper 'not_found' status, insert-after-line operations work perfectly, file-not-found returns 404 as expected, and existing endpoints (health check, chat) remain fully functional. The patchCodeFile tool is production-ready and handles all edge cases correctly with proper git commit/push integration."
+    - agent: "testing"
+      message: "✅ STANDING ORDERS TESTING COMPLETE: All 8 comprehensive tests for the Standing Orders (Trust Boundaries) feature PASSED successfully. The system correctly: (1) Returns empty orders initially, (2) Grants permissions via POST with proper response format, (3) Stores and retrieves multiple standing orders, (4) Revokes permissions correctly, (5) Dynamically injects active standing orders into chat system prompt - LLM correctly identified 'deploy' as the active standing order when asked. MongoDB persistence working perfectly. The trust boundaries feature is production-ready and provides proper autonomous permission management for Jarvis."

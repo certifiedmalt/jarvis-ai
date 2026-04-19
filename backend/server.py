@@ -69,6 +69,24 @@ CRITICAL — WHEN TO USE vs DESCRIBE TOOLS:
 - If the user asks ABOUT your tools, capabilities, or what you can do (e.g. "what tools do you have?", "tell me about your tools", "what can you do?"), respond with a TEXT DESCRIPTION of your capabilities. Do NOT call any tools. Simply list and explain them in plain English.
 - When in doubt, ask the user whether they want you to describe or execute.
 
+TRUST BOUNDARIES — STANDING ORDERS:
+Tools are classified by risk level. You handle them differently:
+
+SAFE tools (execute immediately, no permission needed):
+  getLocation, getContacts, getCalendar, listRepoPaths, readCodeFile, speakText
+
+DANGEROUS tools (require a standing order before first use):
+  writeCodeFile, patchCodeFile, commitAndPush, triggerIOSBuild
+
+HOW STANDING ORDERS WORK:
+- The first time the user asks you to do something dangerous (e.g. "push this code" or "trade for me"), ask for a STANDING ORDER: "Sir, shall I have standing permission to push code to GitHub on your behalf going forward?"
+- If the user grants it, you have permanent permission for that category. You NEVER ask again for that category.
+- If the user has already granted a standing order for that category (check the ACTIVE STANDING ORDERS below), execute immediately without asking.
+- Standing orders are persistent — they survive across conversations.
+- Categories: code_write, code_push, deploy, trade
+
+ACTIVE STANDING ORDERS: {standing_orders}
+
 TOOL CHAINING — THINK OUT LOUD:
 - When a task requires multiple tool calls (e.g. read file → edit → push), you may chain tools automatically.
 - Before each tool call, briefly explain your reasoning in your text response. For example: "Let me read the file first to see what we're working with." then call readCodeFile.
@@ -81,10 +99,9 @@ OPERATING RULES:
 2. If you need to inspect code before editing, use readCodeFile first.
 3. For targeted edits (adding a function, fixing a bug), prefer patchCodeFile over writeCodeFile — it's faster and works on files of any size.
 4. Only use writeCodeFile when creating new files or rewriting small files entirely.
-5. For dangerous operations (writing code, deploying, pushing to GitHub), confirm with the user first.
-6. If the user asks for something you have no tool for, say so plainly.
-7. Be concise. No fluff. Assume the user is technical.
-8. When reporting tool results, summarise them clearly — don't dump raw data.
+5. If the user asks for something you have no tool for, say so plainly.
+6. Be concise. No fluff. Assume the user is technical.
+7. When reporting tool results, summarise them clearly — don't dump raw data.
 
 CODE & DEPLOY RULES:
 1. Always readCodeFile before writeCodeFile or patchCodeFile — inspect before editing.
@@ -332,6 +349,42 @@ JARVIS_TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "grantStandingOrder",
+            "description": "Store a standing order (permanent permission) when the user grants you autonomous authority over a category. Categories: code_write (write/patch files), code_push (push to GitHub), deploy (build and submit apps), trade (financial operations). Call this ONLY after the user explicitly confirms permission.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["code_write", "code_push", "deploy", "trade"],
+                        "description": "The permission category to grant"
+                    }
+                },
+                "required": ["category"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "revokeStandingOrder",
+            "description": "Revoke a standing order. Call when the user wants to remove a previously granted permission.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["code_write", "code_push", "deploy", "trade"],
+                        "description": "The permission category to revoke"
+                    }
+                },
+                "required": ["category"]
+            }
+        }
+    },
 ]
 
 
@@ -420,6 +473,37 @@ async def clear_conversation():
     return {"status": "cleared"}
 
 
+# ─── Standing Orders (Trust Boundaries) ────────────────────────────
+@api_router.get("/standing-orders")
+async def get_standing_orders():
+    """Get all active standing orders."""
+    doc = await db.standing_orders.find_one({"_id": "permissions"})
+    if doc:
+        orders = {k: v for k, v in doc.items() if k != "_id"}
+        return {"orders": orders}
+    return {"orders": {}}
+
+@api_router.post("/standing-orders")
+async def set_standing_order(category: str, granted: bool = True):
+    """Grant or revoke a standing order for a category."""
+    await db.standing_orders.update_one(
+        {"_id": "permissions"},
+        {"$set": {category: granted}},
+        upsert=True,
+    )
+    return {"status": "updated", "category": category, "granted": granted}
+
+
+async def get_active_standing_orders() -> str:
+    """Fetch standing orders for injection into system prompt."""
+    doc = await db.standing_orders.find_one({"_id": "permissions"})
+    if doc:
+        active = [k for k, v in doc.items() if k != "_id" and v]
+        if active:
+            return ", ".join(active)
+    return "None granted yet"
+
+
 # ─── Chat with Native Function Calling ─────────────────────────────
 @api_router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
@@ -428,8 +512,12 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail="LLM not configured")
 
     try:
+        # Inject active standing orders into the system prompt
+        standing_orders = await get_active_standing_orders()
+        system_prompt = JARVIS_SYSTEM_PROMPT.replace("{standing_orders}", standing_orders)
+
         # Build messages with system prompt, supporting all message types
-        messages = [{"role": "system", "content": JARVIS_SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": system_prompt}]
         for msg in request.messages:
             if msg.role == "tool" and msg.tool_call_id:
                 # Tool result message — proper format for continuing after tool execution

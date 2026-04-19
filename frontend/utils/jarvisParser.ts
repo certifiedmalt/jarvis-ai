@@ -52,6 +52,12 @@ export async function executeToolAction(
     return { result: args.text || '', category: 'Voice', displayName: 'speak' };
   }
 
+  // ── Standing Orders (Trust Boundaries) ──────────────────────
+  if (name === 'grantStandingOrder' || name === 'revokeStandingOrder') {
+    const result = await executeStandingOrder(name, args);
+    return { result, category: 'Permission', displayName: name };
+  }
+
   return { result: `Unknown tool: ${name}`, category: 'Unknown', displayName: name };
 }
 
@@ -173,3 +179,27 @@ async function executeDeployHandler(name: string): Promise<string> {
     return `Deploy request failed: ${err.message || String(err)}`;
   }
 }
+
+
+// ── Standing Orders (Trust Boundaries) ─────────────────────────────
+
+async function executeStandingOrder(name: string, args: Record<string, any>): Promise<string> {
+  const category = args.category;
+  if (!category) return 'No category specified for standing order.';
+
+  try {
+    const granted = name === 'grantStandingOrder';
+    const res = await fetch(`${BACKEND_URL}/api/standing-orders?category=${category}&granted=${granted}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const data = await res.json();
+    if (!res.ok) return `Standing order error: ${data.detail || 'Unknown error'}`;
+    return granted
+      ? `Standing order granted: ${category}. I now have permanent autonomous permission for ${category} operations.`
+      : `Standing order revoked: ${category}. I will ask for permission before ${category} operations.`;
+  } catch (err: any) {
+    return `Standing order failed: ${err.message || String(err)}`;
+  }
+}
+
