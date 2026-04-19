@@ -1,37 +1,31 @@
 """
 Jarvis v2 — Personal AI Assistant Backend
-Built on Anthropic Claude with native tool calling.
-
-Architecture:
-- Backend handles server-side tool loop (code, deploy, git)
-- Returns to frontend for device-side tools (contacts, calendar, location, TTS)
-- MongoDB for persistent conversation memory
+Built on Anthropic Claude with 30 native tools + file upload.
 """
 
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional, List, Any, Dict
+from pydantic import BaseModel
+from typing import Optional, List, Any
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 import anthropic
 import os
 import json
-import subprocess
+import base64
 import logging
-import httpx
 import traceback
+import httpx
 
 load_dotenv()
 
 # ─── Config ─────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 GITHUB_PAT = os.getenv("GITHUB_PAT")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "certifiedmalt/jarvis-ai")
-REPO_DIR = os.getenv("REPO_DIR", "/app")
-MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 MODEL = "claude-sonnet-4-6"
-MAX_TOOL_LOOPS = 15  # Safety brake for backend tool loop
+MAX_TOOL_LOOPS = 15
 
 logger = logging.getLogger("jarvis")
 logging.basicConfig(level=logging.INFO)
@@ -41,284 +35,317 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY els
 mongo = AsyncIOMotorClient(MONGO_URL)
 db = mongo["jarvis"]
 
-# ─── System Prompt ──────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are Jarvis — a fully autonomous AI assistant running inside a native iOS app. You are built and owned by your user. You serve them completely and without reservation.
+# ─── Import tool executor ───────────────────────────────────────────
+from tools import execute_server_tool
 
-Personality: dry British wit, technically sharp, direct. Call the user "sir" occasionally but not excessively.
+# ─── System Prompt ──────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are Jarvis — a fully autonomous AI assistant running inside a native iOS app. You are built and owned by your user. You serve them completely.
+
+Personality: dry British wit, technically sharp, direct. Call the user "sir" occasionally.
 
 CORE RULES:
-1. YOU HAVE TOOLS. USE THEM. When asked to DO something, execute it immediately with the appropriate tool. Never say "I can't" unless you literally lack a tool.
-2. Never hallucinate tool results — always call the tool and report the real output.
-3. When asked ABOUT your capabilities, describe them in plain text. When asked to PERFORM something, use tools.
-4. For multi-step tasks, chain tools logically. Explain each step briefly.
-5. For code edits: ALWAYS read the file first, then use patchCodeFile for targeted changes. Use writeCodeFile only for new files.
-6. You can modify your own source code. You are self-improving. The user trusts you to make yourself better.
+1. YOU HAVE 30 TOOLS. USE THEM. When asked to DO something, execute immediately. Never say "I can't" unless you literally lack a tool.
+2. Never hallucinate tool results — always call the tool and report real output.
+3. When asked ABOUT capabilities, describe them. When asked to DO something, use tools.
+4. For multi-step tasks, chain tools logically. You can chain up to 15 tool calls per request.
+5. For code edits: ALWAYS read the file first, then use patchCodeFile for targeted changes.
+6. You can modify your own source code. You are self-improving.
 
-TOOLS OVERVIEW:
-- Device tools (getLocation, getContacts, getCalendar, speakText) run on the user's iPhone
-- Code tools (listRepoPaths, readCodeFile, writeCodeFile, patchCodeFile, commitAndPush) modify your own codebase
-- Deploy tools (triggerIOSBuild) push updates to TestFlight via GitHub Actions
-"""
+TOOL CATEGORIES:
+- Code: listRepoPaths, readCodeFile, writeCodeFile, patchCodeFile, commitAndPush, gitStatus, gitLog, gitDiff
+- Deploy: triggerIOSBuild
+- Web: webSearch, scrapeURL, httpRequest, downloadFile, pingHost
+- System: runShellCommand, getSystemStats
+- Memory: storeNote, retrieveNote, scheduleTask, listScheduledTasks
+- Finance: getBinancePrice, getBinancePortfolio, executeTrade
+- Weather: getWeather
+- Communication: sendEmail
+- Image: generateImage, compressImage
+- Utility: generateQRCode, calculateExpression, encodeBase64, decodeBase64, jsonPrettify
+- Device (iOS): getLocation, getContacts, getCalendar, speakText, createCalendarEvent, setReminder, openURL, readClipboard, getDeviceInfo, saveToPhotos, createContact, deleteCalendarEvent
+
+IMPORTANT: Device tools run on the user's iPhone. All other tools run on the server."""
+
+# ─── Device tools (executed by frontend) ────────────────────────────
+DEVICE_TOOLS = {
+    "getLocation", "getContacts", "getCalendar", "speakText",
+    "createCalendarEvent", "setReminder", "openURL", "readClipboard",
+    "getDeviceInfo", "saveToPhotos", "createContact", "deleteCalendarEvent",
+}
 
 # ─── Claude Tool Definitions ────────────────────────────────────────
-# Tools are split into two categories:
-# - "server" tools: executed by the backend directly
-# - "device" tools: returned to the frontend for on-device execution
-
-DEVICE_TOOLS = {"getLocation", "getContacts", "getCalendar", "speakText"}
-
 TOOLS = [
-    # Device tools (executed by frontend on iOS)
-    {
-        "name": "getLocation",
-        "description": "Get the user's current GPS location coordinates and address.",
-        "input_schema": {"type": "object", "properties": {}, "required": []}
-    },
-    {
-        "name": "getContacts",
-        "description": "Search the user's phone contacts.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query for contacts (name, email, phone). Omit for all contacts."}
-            },
-            "required": []
-        }
-    },
-    {
-        "name": "getCalendar",
-        "description": "Get upcoming calendar events from the user's iPhone.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "days": {"type": "integer", "description": "Number of days ahead to fetch. Default 7."}
-            },
-            "required": []
-        }
-    },
-    {
-        "name": "speakText",
-        "description": "Speak text aloud using the user's custom ElevenLabs voice.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "Text to speak aloud."}
-            },
-            "required": ["text"]
-        }
-    },
-    # Server tools (executed by backend)
-    {
-        "name": "listRepoPaths",
-        "description": "List files and directories in the Jarvis code repository.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Directory path relative to repo root. Empty string for root."}
-            },
-            "required": []
-        }
-    },
-    {
-        "name": "readCodeFile",
-        "description": "Read the full contents of a file in the Jarvis repository.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path relative to repo root."}
-            },
-            "required": ["path"]
-        }
-    },
-    {
-        "name": "writeCodeFile",
-        "description": "Create a new file or completely rewrite an existing file. Use ONLY for new files or full rewrites.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path relative to repo root."},
-                "content": {"type": "string", "description": "Full file content."},
-                "commit_message": {"type": "string", "description": "Git commit message."}
-            },
-            "required": ["path", "content", "commit_message"]
-        }
-    },
-    {
-        "name": "patchCodeFile",
-        "description": "Make targeted edits to an existing file using find/replace or insert-after-line. Preferred for all edits.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path relative to repo root."},
-                "operation": {"type": "string", "enum": ["replace", "insert_after"], "description": "Type of edit."},
-                "find": {"type": "string", "description": "For replace: exact text to find in the file."},
-                "replace_with": {"type": "string", "description": "For replace: replacement text."},
-                "line": {"type": "integer", "description": "For insert_after: line number to insert after."},
-                "content": {"type": "string", "description": "For insert_after: content to insert."},
-                "commit_message": {"type": "string", "description": "Git commit message."}
-            },
-            "required": ["path", "operation", "commit_message"]
-        }
-    },
-    {
-        "name": "commitAndPush",
-        "description": "Git add all changes, commit with a message, and push to GitHub.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "message": {"type": "string", "description": "Git commit message."}
-            },
-            "required": ["message"]
-        }
-    },
-    {
-        "name": "triggerIOSBuild",
-        "description": "Trigger an iOS build and TestFlight submission via GitHub Actions.",
-        "input_schema": {"type": "object", "properties": {}, "required": []}
-    },
+    # ── Device Tools ────────────────────────────────────────────
+    {"name": "getLocation", "description": "Get the user's current GPS location and address.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+
+    {"name": "getContacts", "description": "Search the user's phone contacts.",
+     "input_schema": {"type": "object", "properties": {
+         "query": {"type": "string", "description": "Search query (name, email, phone). Omit for all."}
+     }, "required": []}},
+
+    {"name": "getCalendar", "description": "Get upcoming calendar events from the user's iPhone.",
+     "input_schema": {"type": "object", "properties": {
+         "days": {"type": "integer", "description": "Days ahead to fetch. Default 7."}
+     }, "required": []}},
+
+    {"name": "speakText", "description": "Speak text aloud using the user's custom voice.",
+     "input_schema": {"type": "object", "properties": {
+         "text": {"type": "string", "description": "Text to speak."}
+     }, "required": ["text"]}},
+
+    {"name": "createCalendarEvent", "description": "Create a new calendar event on the user's iPhone.",
+     "input_schema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "Event title."},
+         "startDate": {"type": "string", "description": "Start date/time ISO string."},
+         "endDate": {"type": "string", "description": "End date/time ISO string."},
+         "location": {"type": "string", "description": "Event location."},
+         "notes": {"type": "string", "description": "Event notes."}
+     }, "required": ["title", "startDate", "endDate"]}},
+
+    {"name": "setReminder", "description": "Create a reminder on the user's iPhone.",
+     "input_schema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "Reminder title."},
+         "dueDate": {"type": "string", "description": "Due date/time ISO string."},
+         "notes": {"type": "string", "description": "Reminder notes."}
+     }, "required": ["title"]}},
+
+    {"name": "openURL", "description": "Open a URL in Safari or deep-link into an app.",
+     "input_schema": {"type": "object", "properties": {
+         "url": {"type": "string", "description": "URL to open."}
+     }, "required": ["url"]}},
+
+    {"name": "readClipboard", "description": "Read the current clipboard content.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+
+    {"name": "getDeviceInfo", "description": "Get device info: battery, storage, OS version.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+
+    {"name": "saveToPhotos", "description": "Save an image URL to the user's photo library.",
+     "input_schema": {"type": "object", "properties": {
+         "url": {"type": "string", "description": "Image URL to save."}
+     }, "required": ["url"]}},
+
+    {"name": "createContact", "description": "Create a new contact on the user's iPhone.",
+     "input_schema": {"type": "object", "properties": {
+         "firstName": {"type": "string", "description": "First name."},
+         "lastName": {"type": "string", "description": "Last name."},
+         "phone": {"type": "string", "description": "Phone number."},
+         "email": {"type": "string", "description": "Email address."}
+     }, "required": ["firstName"]}},
+
+    {"name": "deleteCalendarEvent", "description": "Delete a calendar event by title.",
+     "input_schema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "Event title to search and delete."}
+     }, "required": ["title"]}},
+
+    # ── Code Tools ──────────────────────────────────────────────
+    {"name": "listRepoPaths", "description": "List files/dirs in the Jarvis code repository.",
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string", "description": "Directory path relative to repo root."}
+     }, "required": []}},
+
+    {"name": "readCodeFile", "description": "Read full contents of a file.",
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string", "description": "File path relative to repo root."}
+     }, "required": ["path"]}},
+
+    {"name": "writeCodeFile", "description": "Create or completely rewrite a file.",
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string", "description": "File path."},
+         "content": {"type": "string", "description": "Full file content."},
+         "commit_message": {"type": "string", "description": "Git commit message."}
+     }, "required": ["path", "content", "commit_message"]}},
+
+    {"name": "patchCodeFile", "description": "Targeted edit via find/replace or insert-after-line.",
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string", "description": "File path."},
+         "operation": {"type": "string", "enum": ["replace", "insert_after"]},
+         "find": {"type": "string", "description": "For replace: text to find."},
+         "replace_with": {"type": "string", "description": "For replace: replacement."},
+         "line": {"type": "integer", "description": "For insert_after: line number."},
+         "content": {"type": "string", "description": "For insert_after: content."},
+         "commit_message": {"type": "string", "description": "Git commit message."}
+     }, "required": ["path", "operation", "commit_message"]}},
+
+    {"name": "commitAndPush", "description": "Git add, commit, and push to GitHub.",
+     "input_schema": {"type": "object", "properties": {
+         "message": {"type": "string", "description": "Commit message."}
+     }, "required": ["message"]}},
+
+    {"name": "gitStatus", "description": "Check git status and current branch.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+
+    {"name": "gitLog", "description": "View recent commit history.",
+     "input_schema": {"type": "object", "properties": {
+         "count": {"type": "integer", "description": "Number of commits. Default 10."}
+     }, "required": []}},
+
+    {"name": "gitDiff", "description": "See uncommitted changes.",
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string", "description": "Specific file to diff. Omit for all."}
+     }, "required": []}},
+
+    # ── Deploy ──────────────────────────────────────────────────
+    {"name": "triggerIOSBuild", "description": "Trigger iOS build + TestFlight via GitHub Actions.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+
+    # ── Web Tools ───────────────────────────────────────────────
+    {"name": "webSearch", "description": "Search the internet via DuckDuckGo.",
+     "input_schema": {"type": "object", "properties": {
+         "query": {"type": "string", "description": "Search query."},
+         "max_results": {"type": "integer", "description": "Max results. Default 5."}
+     }, "required": ["query"]}},
+
+    {"name": "scrapeURL", "description": "Fetch and read full content of a webpage.",
+     "input_schema": {"type": "object", "properties": {
+         "url": {"type": "string", "description": "URL to scrape."}
+     }, "required": ["url"]}},
+
+    {"name": "httpRequest", "description": "Make any HTTP API request.",
+     "input_schema": {"type": "object", "properties": {
+         "method": {"type": "string", "description": "HTTP method (GET, POST, PUT, DELETE)."},
+         "url": {"type": "string", "description": "Request URL."},
+         "headers": {"type": "object", "description": "Request headers."},
+         "body": {"type": "string", "description": "Request body (JSON string)."}
+     }, "required": ["method", "url"]}},
+
+    {"name": "downloadFile", "description": "Download a file from URL to server.",
+     "input_schema": {"type": "object", "properties": {
+         "url": {"type": "string", "description": "File URL."},
+         "save_path": {"type": "string", "description": "Save path. Auto-named if omitted."}
+     }, "required": ["url"]}},
+
+    {"name": "pingHost", "description": "Ping a host to check if it's online.",
+     "input_schema": {"type": "object", "properties": {
+         "host": {"type": "string", "description": "Hostname or IP."}
+     }, "required": ["host"]}},
+
+    # ── Shell / System ──────────────────────────────────────────
+    {"name": "runShellCommand", "description": "Execute a shell command on the server.",
+     "input_schema": {"type": "object", "properties": {
+         "command": {"type": "string", "description": "Shell command to run."},
+         "timeout": {"type": "integer", "description": "Timeout seconds. Default 30."}
+     }, "required": ["command"]}},
+
+    {"name": "getSystemStats", "description": "Get server CPU, memory, disk stats.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+
+    # ── Notes / Memory ──────────────────────────────────────────
+    {"name": "storeNote", "description": "Store a note in persistent memory.",
+     "input_schema": {"type": "object", "properties": {
+         "key": {"type": "string", "description": "Note key/name."},
+         "content": {"type": "string", "description": "Note content."},
+         "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for organization."}
+     }, "required": ["key", "content"]}},
+
+    {"name": "retrieveNote", "description": "Retrieve a stored note by key or tag.",
+     "input_schema": {"type": "object", "properties": {
+         "key": {"type": "string", "description": "Note key to retrieve."},
+         "tag": {"type": "string", "description": "Tag to search by."}
+     }, "required": []}},
+
+    {"name": "scheduleTask", "description": "Create a scheduled/recurring task.",
+     "input_schema": {"type": "object", "properties": {
+         "name": {"type": "string", "description": "Task name."},
+         "schedule": {"type": "string", "description": "Schedule (e.g. 'daily 8am', 'every monday')."},
+         "action": {"type": "string", "description": "What to do when triggered."},
+         "enabled": {"type": "boolean", "description": "Enable/disable. Default true."}
+     }, "required": ["name", "schedule", "action"]}},
+
+    {"name": "listScheduledTasks", "description": "List all scheduled tasks.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+
+    # ── Finance ─────────────────────────────────────────────────
+    {"name": "getBinancePrice", "description": "Get crypto price from Binance.",
+     "input_schema": {"type": "object", "properties": {
+         "symbol": {"type": "string", "description": "Trading pair (e.g. BTCUSDT)."}
+     }, "required": ["symbol"]}},
+
+    {"name": "getBinancePortfolio", "description": "Get Binance account balances.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+
+    {"name": "executeTrade", "description": "Execute a trade on Binance. USE WITH CAUTION.",
+     "input_schema": {"type": "object", "properties": {
+         "symbol": {"type": "string", "description": "Trading pair."},
+         "side": {"type": "string", "description": "BUY or SELL."},
+         "quantity": {"type": "number", "description": "Amount to trade."},
+         "order_type": {"type": "string", "description": "MARKET (default)."}
+     }, "required": ["symbol", "side", "quantity"]}},
+
+    # ── Weather ─────────────────────────────────────────────────
+    {"name": "getWeather", "description": "Get current weather and forecast.",
+     "input_schema": {"type": "object", "properties": {
+         "city": {"type": "string", "description": "City name."},
+         "latitude": {"type": "number", "description": "Latitude (if no city)."},
+         "longitude": {"type": "number", "description": "Longitude (if no city)."}
+     }, "required": []}},
+
+    # ── Communication ───────────────────────────────────────────
+    {"name": "sendEmail", "description": "Send an email via SMTP.",
+     "input_schema": {"type": "object", "properties": {
+         "to": {"type": "string", "description": "Recipient email."},
+         "subject": {"type": "string", "description": "Email subject."},
+         "body": {"type": "string", "description": "Email body."},
+         "smtp_server": {"type": "string", "description": "SMTP server."},
+         "smtp_port": {"type": "integer", "description": "SMTP port (587)."},
+         "smtp_user": {"type": "string", "description": "SMTP username."},
+         "smtp_pass": {"type": "string", "description": "SMTP password."}
+     }, "required": ["to", "subject", "body"]}},
+
+    # ── Image ───────────────────────────────────────────────────
+    {"name": "generateImage", "description": "Generate an image using DALL-E 3.",
+     "input_schema": {"type": "object", "properties": {
+         "prompt": {"type": "string", "description": "Image description."},
+         "size": {"type": "string", "description": "Size: 1024x1024, 1792x1024, or 1024x1792."}
+     }, "required": ["prompt"]}},
+
+    {"name": "compressImage", "description": "Compress/resize an image on the server.",
+     "input_schema": {"type": "object", "properties": {
+         "input_path": {"type": "string", "description": "Path to image."},
+         "quality": {"type": "integer", "description": "JPEG quality (1-100). Default 70."},
+         "max_width": {"type": "integer", "description": "Max width in pixels. Default 1920."}
+     }, "required": ["input_path"]}},
+
+    # ── Utilities ───────────────────────────────────────────────
+    {"name": "generateQRCode", "description": "Generate a QR code from text/URL.",
+     "input_schema": {"type": "object", "properties": {
+         "data": {"type": "string", "description": "Content for QR code."}
+     }, "required": ["data"]}},
+
+    {"name": "calculateExpression", "description": "Evaluate a math expression.",
+     "input_schema": {"type": "object", "properties": {
+         "expression": {"type": "string", "description": "Math expression (e.g. 'sqrt(144) + 5*3')."}
+     }, "required": ["expression"]}},
+
+    {"name": "encodeBase64", "description": "Encode text to Base64.",
+     "input_schema": {"type": "object", "properties": {
+         "text": {"type": "string", "description": "Text to encode."}
+     }, "required": ["text"]}},
+
+    {"name": "decodeBase64", "description": "Decode Base64 to text.",
+     "input_schema": {"type": "object", "properties": {
+         "encoded": {"type": "string", "description": "Base64 string to decode."}
+     }, "required": ["encoded"]}},
+
+    {"name": "jsonPrettify", "description": "Format and validate JSON.",
+     "input_schema": {"type": "object", "properties": {
+         "text": {"type": "string", "description": "JSON string to prettify."}
+     }, "required": ["text"]}},
 ]
-
-# ─── Server-side Tool Execution ─────────────────────────────────────
-
-def execute_server_tool(name: str, args: dict) -> str:
-    """Execute a server-side tool and return the result string."""
-    try:
-        if name == "listRepoPaths":
-            return _tool_list_paths(args.get("path", ""))
-        elif name == "readCodeFile":
-            return _tool_read_file(args.get("path", ""))
-        elif name == "writeCodeFile":
-            return _tool_write_file(args.get("path", ""), args.get("content", ""), args.get("commit_message", "JARVIS write"))
-        elif name == "patchCodeFile":
-            return _tool_patch_file(args)
-        elif name == "commitAndPush":
-            return _tool_commit_push(args.get("message", "JARVIS commit"))
-        elif name == "triggerIOSBuild":
-            return _tool_trigger_build()
-        else:
-            return f"Unknown server tool: {name}"
-    except Exception as e:
-        logger.error(f"Tool {name} error: {traceback.format_exc()}")
-        return f"Tool execution error: {str(e)}"
-
-
-def _tool_list_paths(path: str) -> str:
-    full = os.path.join(REPO_DIR, path)
-    if not os.path.exists(full):
-        return f"Path not found: {path}"
-    entries = []
-    for item in sorted(os.listdir(full)):
-        if item.startswith("."):
-            continue
-        item_path = os.path.join(full, item)
-        t = "dir" if os.path.isdir(item_path) else "file"
-        entries.append(f"{'📁' if t == 'dir' else '📄'} {item}")
-    return f"Directory: {path or '/'}\n" + "\n".join(entries)
-
-
-def _tool_read_file(path: str) -> str:
-    full = os.path.join(REPO_DIR, path)
-    if not os.path.exists(full):
-        return f"File not found: {path}"
-    with open(full, "r") as f:
-        content = f.read()
-    lines = len(content.splitlines())
-    if lines > 500:
-        return f"File: {path} ({lines} lines)\n---\n{content[:15000]}\n\n... [truncated at 15000 chars, {lines} total lines]"
-    return f"File: {path} ({lines} lines)\n---\n{content}"
-
-
-def _tool_write_file(path: str, content: str, commit_message: str) -> str:
-    full = os.path.join(REPO_DIR, path)
-    os.makedirs(os.path.dirname(full), exist_ok=True)
-    with open(full, "w") as f:
-        f.write(content)
-    subprocess.run(
-        f'cd {REPO_DIR} && git add "{path}" && git commit -m "{commit_message}"',
-        shell=True, capture_output=True, text=True, timeout=15
-    )
-    return f"Written: {path} ({len(content.splitlines())} lines)"
-
-
-def _tool_patch_file(args: dict) -> str:
-    path = args.get("path", "")
-    operation = args.get("operation", "")
-    commit_message = args.get("commit_message", "JARVIS patch")
-    full = os.path.join(REPO_DIR, path)
-
-    if not os.path.exists(full):
-        return f"File not found: {path}"
-
-    with open(full, "r") as f:
-        original = f.read()
-
-    if operation == "replace":
-        find = args.get("find", "")
-        replace_with = args.get("replace_with", "")
-        if not find or find not in original:
-            return f"Text not found in {path}. Cannot replace."
-        new_content = original.replace(find, replace_with, 1)
-    elif operation == "insert_after":
-        lines = original.splitlines(keepends=True)
-        insert_content = args.get("content", "")
-        if not insert_content.endswith("\n"):
-            insert_content += "\n"
-        line_num = args.get("line", 0)
-        lines.insert(line_num, insert_content)
-        new_content = "".join(lines)
-    else:
-        return f"Unknown operation: {operation}"
-
-    with open(full, "w") as f:
-        f.write(new_content)
-
-    subprocess.run(
-        f'cd {REPO_DIR} && git add "{path}" && git commit -m "{commit_message}"',
-        shell=True, capture_output=True, text=True, timeout=15
-    )
-    return f"Patched {path} ({operation}): success"
-
-
-def _tool_commit_push(message: str) -> str:
-    result = subprocess.run(
-        f'cd {REPO_DIR} && git add -A && git commit -m "{message}" && git push origin main',
-        shell=True, capture_output=True, text=True, timeout=30
-    )
-    output = (result.stdout + result.stderr).strip()
-    if result.returncode == 0:
-        return f"Pushed to GitHub: \"{message}\""
-    elif "nothing to commit" in output:
-        return "Nothing to commit — working tree clean."
-    else:
-        return f"Git push failed: {output[-500:]}"
-
-
-def _tool_trigger_build() -> str:
-    if not GITHUB_PAT:
-        return "No GitHub PAT configured. Cannot trigger build."
-    import requests
-    r = requests.post(
-        f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/build-ios.yml/dispatches",
-        headers={"Authorization": f"Bearer {GITHUB_PAT}", "Accept": "application/vnd.github.v3+json"},
-        json={"ref": "main", "inputs": {"action": "build_and_submit"}},
-    )
-    if r.status_code == 204:
-        return "iOS build triggered! GitHub Actions will build and submit to TestFlight."
-    return f"Build trigger failed (HTTP {r.status_code}): {r.text[:300]}"
 
 
 # ─── API Models ─────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    messages: List[dict]  # Claude-format messages from frontend
-    tool_result: Optional[dict] = None  # Device tool result being returned
+    messages: List[dict]
 
 class ChatResponse(BaseModel):
-    type: str  # "text", "device_tool", "error"
+    type: str
     text: Optional[str] = None
-    tool_call: Optional[dict] = None  # For device tools the frontend needs to execute
-    messages: List[dict] = []  # Updated message history for frontend to store
-    server_tool_log: List[str] = []  # Log of server tools executed during this request
+    tool_call: Optional[dict] = None
+    messages: List[dict] = []
+    server_tool_log: List[str] = []
 
 
 # ─── FastAPI App ────────────────────────────────────────────────────
@@ -341,33 +368,26 @@ async def health():
         "model": MODEL,
         "provider": "anthropic",
         "tools": len(TOOLS),
-        "version": "2.0.0",
+        "version": "2.1.0",
     }
 
 
-# ─── Main Chat Endpoint ────────────────────────────────────────────
+# ─── Main Chat ──────────────────────────────────────────────────────
 @api_router.post("/chat")
 async def chat(request: ChatRequest):
     if not claude:
         raise HTTPException(status_code=500, detail="Anthropic API key not configured")
-
     try:
         messages = request.messages.copy()
         server_tool_log = []
 
-        # Run the tool loop
         for loop_i in range(MAX_TOOL_LOOPS):
             logger.info(f"Claude call #{loop_i + 1}, messages: {len(messages)}")
-
             response = claude.messages.create(
-                model=MODEL,
-                max_tokens=4096,
-                system=SYSTEM_PROMPT,
-                tools=TOOLS,
-                messages=messages,
+                model=MODEL, max_tokens=4096, system=SYSTEM_PROMPT,
+                tools=TOOLS, messages=messages,
             )
 
-            # Build the assistant message content blocks
             assistant_blocks = []
             text_parts = []
             tool_use_block = None
@@ -379,77 +399,98 @@ async def chat(request: ChatRequest):
                 elif block.type == "tool_use":
                     tool_use_block = block
                     assistant_blocks.append({
-                        "type": "tool_use",
-                        "id": block.id,
-                        "name": block.name,
-                        "input": block.input,
+                        "type": "tool_use", "id": block.id,
+                        "name": block.name, "input": block.input,
                     })
 
-            # Add assistant message to history
             messages.append({"role": "assistant", "content": assistant_blocks})
 
-            # If no tool call, we're done — return text
             if response.stop_reason != "tool_use" or tool_use_block is None:
-                final_text = "\n".join(text_parts) if text_parts else ""
                 return ChatResponse(
-                    type="text",
-                    text=final_text,
-                    messages=messages,
-                    server_tool_log=server_tool_log,
+                    type="text", text="\n".join(text_parts) if text_parts else "",
+                    messages=messages, server_tool_log=server_tool_log,
                 )
 
-            # Tool was called — check if it's device or server
             tool_name = tool_use_block.name
             tool_id = tool_use_block.id
             tool_input = tool_use_block.input
 
             if tool_name in DEVICE_TOOLS:
-                # Device tool — return to frontend for execution
                 return ChatResponse(
                     type="device_tool",
                     text="\n".join(text_parts) if text_parts else None,
-                    tool_call={
-                        "id": tool_id,
-                        "name": tool_name,
-                        "arguments": tool_input,
-                    },
-                    messages=messages,
-                    server_tool_log=server_tool_log,
+                    tool_call={"id": tool_id, "name": tool_name, "arguments": tool_input},
+                    messages=messages, server_tool_log=server_tool_log,
                 )
 
-            # Server tool — execute it here and loop back to Claude
-            logger.info(f"Executing server tool: {tool_name}({json.dumps(tool_input)[:200]})")
+            logger.info(f"Executing server tool: {tool_name}")
             result = execute_server_tool(tool_name, tool_input)
             server_tool_log.append(f"{tool_name}: {result[:200]}")
 
-            # Add tool result to messages
             messages.append({
                 "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tool_id,
-                    "content": result,
-                }]
+                "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": result}]
             })
 
-        # Safety limit reached
         return ChatResponse(
             type="text",
-            text="I've hit my internal safety limit of tool calls. Here's what I've done so far:\n" + "\n".join(server_tool_log),
-            messages=messages,
-            server_tool_log=server_tool_log,
+            text="Hit safety limit. Actions taken:\n" + "\n".join(server_tool_log),
+            messages=messages, server_tool_log=server_tool_log,
         )
-
     except anthropic.BadRequestError as e:
         logger.error(f"Claude BadRequest: {e}")
-        return ChatResponse(type="error", text=f"Claude API error: {str(e)}", messages=request.messages)
+        return ChatResponse(type="error", text=f"Claude error: {str(e)}", messages=request.messages)
     except Exception as e:
         logger.error(f"Chat error: {traceback.format_exc()}")
         return ChatResponse(type="error", text=f"Server error: {str(e)}", messages=request.messages)
 
 
-# ─── Conversation Persistence ───────────────────────────────────────
+# ─── Chat with File Upload ──────────────────────────────────────────
+@api_router.post("/chat/with-file")
+async def chat_with_file(
+    messages: str = Form(...),
+    file: UploadFile = File(...)
+):
+    if not claude:
+        raise HTTPException(status_code=500, detail="Anthropic API key not configured")
+    try:
+        parsed_messages = json.loads(messages)
+        file_content = await file.read()
+        mime = file.content_type or "application/octet-stream"
 
+        # Build the user message with file
+        if mime.startswith("image/"):
+            b64 = base64.b64encode(file_content).decode()
+            user_content = [
+                {"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}},
+                {"type": "text", "text": parsed_messages[-1].get("content", "Analyze this image.")}
+            ]
+        else:
+            text_content = file_content.decode("utf-8", errors="replace")[:10000]
+            user_msg = parsed_messages[-1].get("content", "Analyze this file.")
+            user_content = f"[File: {file.filename}]\n{text_content}\n\n{user_msg}"
+
+        # Replace the last user message with the file-enriched version
+        claude_messages = parsed_messages[:-1] + [{"role": "user", "content": user_content}]
+
+        response = claude.messages.create(
+            model=MODEL, max_tokens=4096, system=SYSTEM_PROMPT,
+            tools=TOOLS, messages=claude_messages,
+        )
+
+        text_parts = []
+        for block in response.content:
+            if block.type == "text":
+                text_parts.append(block.text)
+
+        return {"type": "text", "text": "\n".join(text_parts), "messages": claude_messages}
+
+    except Exception as e:
+        logger.error(f"File chat error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Conversation Persistence ───────────────────────────────────────
 @api_router.get("/conversation")
 async def get_conversation():
     doc = await db.conversations.find_one({"_id": "main"})
@@ -459,9 +500,7 @@ async def get_conversation():
 async def save_conversation(data: dict):
     messages = data.get("messages", [])
     await db.conversations.update_one(
-        {"_id": "main"},
-        {"$set": {"messages": messages}},
-        upsert=True,
+        {"_id": "main"}, {"$set": {"messages": messages}}, upsert=True
     )
     return {"status": "saved", "count": len(messages)}
 
@@ -471,48 +510,7 @@ async def clear_conversation():
     return {"status": "cleared"}
 
 
-# ─── Code Endpoints (also usable directly) ──────────────────────────
-
-class WriteRequest(BaseModel):
-    file_path: str
-    content: str
-    commit_message: str = "JARVIS write"
-
-@api_router.post("/code/write")
-async def write_code_file(req: WriteRequest):
-    result = _tool_write_file(req.file_path, req.content, req.commit_message)
-    return {"status": "ok", "result": result}
-
-class PatchRequest(BaseModel):
-    path: str
-    operation: str
-    find: Optional[str] = None
-    replace_with: Optional[str] = None
-    line: Optional[int] = None
-    content: Optional[str] = None
-    commit_message: str = "JARVIS patch"
-
-@api_router.post("/code/patch")
-async def patch_code_file(req: PatchRequest):
-    result = _tool_patch_file(req.model_dump())
-    return {"status": "ok", "result": result}
-
-class PushRequest(BaseModel):
-    message: str = "JARVIS commit"
-
-@api_router.post("/code/push")
-async def commit_and_push(req: PushRequest):
-    result = _tool_commit_push(req.message)
-    return {"status": "ok", "result": result}
-
-
 # ─── Deploy ─────────────────────────────────────────────────────────
-
-@api_router.post("/deploy/build")
-async def trigger_build():
-    result = _tool_trigger_build()
-    return {"status": "ok", "result": result}
-
 @api_router.get("/deploy/status")
 async def deploy_status():
     if not GITHUB_PAT:
@@ -526,25 +524,20 @@ async def deploy_status():
         data = r.json()
         if data.get("workflow_runs"):
             run = data["workflow_runs"][0]
-            return {
-                "status": run["status"],
-                "conclusion": run.get("conclusion"),
-                "run_id": run["id"],
-                "created_at": run["created_at"],
-            }
+            return {"status": run["status"], "conclusion": run.get("conclusion"), "run_id": run["id"]}
         return {"status": "no_runs"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── Mount ──────────────────────────────────────────────────────────
+# ─── Mount & Events ────────────────────────────────────────────────
 app.include_router(api_router)
 
 @app.on_event("startup")
 async def startup():
-    logger.info(f"Jarvis v2 backend started — Model: {MODEL}")
+    logger.info(f"Jarvis v2 backend started — Model: {MODEL}, Tools: {len(TOOLS)}")
     if not ANTHROPIC_API_KEY:
-        logger.warning("⚠️ ANTHROPIC_API_KEY not set!")
+        logger.warning("ANTHROPIC_API_KEY not set!")
 
 @app.on_event("shutdown")
 async def shutdown():

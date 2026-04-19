@@ -11,13 +11,16 @@ import {
   ActivityIndicator,
   Keyboard,
   Alert,
+  ActionSheetIOS,
+  Image,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Constants from 'expo-constants';
+import * as DocumentPicker from 'expo-document-picker';
+import * as ImagePicker from 'expo-image-picker';
+import * as FileSystem from 'expo-file-system';
 
 // ─── Config ─────────────────────────────────────────────────────────
-// Dev: uses EXPO_PUBLIC_BACKEND_URL from .env (Emergent preview)
-// Prod: falls back to Railway
 const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL
   || Constants.expoConfig?.extra?.EXPO_PUBLIC_BACKEND_URL
   || 'https://jarvis-backend-production-a86c.up.railway.app';
@@ -27,6 +30,7 @@ type Message = {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  fileName?: string;
 };
 
 type ToolCall = {
@@ -35,8 +39,15 @@ type ToolCall = {
   arguments: Record<string, any>;
 };
 
+type AttachedFile = {
+  name: string;
+  uri: string;
+  mimeType: string;
+  size: number;
+};
+
 // ─── Device Tool Imports ────────────────────────────────────────────
-import { executeDeviceAction } from '../utils/deviceActions';
+import { executeDeviceTool } from '../utils/deviceActions';
 
 export default function JarvisChat() {
   const insets = useSafeAreaInsets();
@@ -47,6 +58,7 @@ export default function JarvisChat() {
   const [isOnline, setIsOnline] = useState(false);
   const [modelName, setModelName] = useState('Connecting...');
   const [toolLog, setToolLog] = useState<string[]>([]);
+  const [attachedFile, setAttachedFile] = useState<AttachedFile | null>(null);
   const abortRef = useRef(false);
   const scrollViewRef = useRef<ScrollView>(null);
 
@@ -150,18 +162,7 @@ export default function JarvisChat() {
     // Map tool name to device action
     let result: string;
     try {
-      if (name === 'getContacts') {
-        result = await executeDeviceAction({ action: 'get_contacts', search: args.query });
-      } else if (name === 'getCalendar') {
-        result = await executeDeviceAction({ action: 'get_calendar', days: args.days || 7 });
-      } else if (name === 'getLocation') {
-        result = await executeDeviceAction({ action: 'get_location' });
-      } else if (name === 'speakText') {
-        // For speak, we just display the text (TTS handled separately)
-        result = `Speaking: "${args.text}"`;
-      } else {
-        result = `Unknown device tool: ${name}`;
-      }
+      result = await executeDeviceTool(name, args);
     } catch (err: any) {
       result = `Device error: ${err.message || String(err)}`;
     }
@@ -231,40 +232,116 @@ export default function JarvisChat() {
     }
   }, [saveConversation]);
 
+  // ─── File Attachment ────────────────────────────────────────────────
+  const pickFromPhotos = useCallback(async () => {
+    const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!perm.granted) { Alert.alert('Permission needed', 'Allow photo library access.'); return; }
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.8 });
+    if (!result.canceled && result.assets?.[0]) {
+      const a = result.assets[0];
+      const info = await FileSystem.getInfoAsync(a.uri);
+      setAttachedFile({
+        name: a.fileName || 'photo.jpg',
+        uri: a.uri,
+        mimeType: a.mimeType || 'image/jpeg',
+        size: (info as any).size || 0,
+      });
+    }
+  }, []);
+
+  const pickFromCamera = useCallback(async () => {
+    const perm = await ImagePicker.requestCameraPermissionsAsync();
+    if (!perm.granted) { Alert.alert('Permission needed', 'Allow camera access.'); return; }
+    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], quality: 0.8 });
+    if (!result.canceled && result.assets?.[0]) {
+      const a = result.assets[0];
+      const info = await FileSystem.getInfoAsync(a.uri);
+      setAttachedFile({
+        name: a.fileName || 'capture.jpg',
+        uri: a.uri,
+        mimeType: a.mimeType || 'image/jpeg',
+        size: (info as any).size || 0,
+      });
+    }
+  }, []);
+
+  const pickFromFiles = useCallback(async () => {
+    const result = await DocumentPicker.getDocumentAsync({ type: '*/*', copyToCacheDirectory: true });
+    if (!result.canceled && result.assets?.[0]) {
+      const a = result.assets[0];
+      setAttachedFile({
+        name: a.name,
+        uri: a.uri,
+        mimeType: a.mimeType || 'application/octet-stream',
+        size: a.size || 0,
+      });
+    }
+  }, []);
+
+  const showAttachOptions = useCallback(() => {
+    if (Platform.OS === 'ios') {
+      ActionSheetIOS.showActionSheetWithOptions(
+        { options: ['Cancel', 'Photos', 'Camera', 'Files'], cancelButtonIndex: 0 },
+        (i) => { if (i === 1) pickFromPhotos(); else if (i === 2) pickFromCamera(); else if (i === 3) pickFromFiles(); }
+      );
+    } else {
+      Alert.alert('Attach', 'Choose source', [
+        { text: 'Photos', onPress: pickFromPhotos },
+        { text: 'Camera', onPress: pickFromCamera },
+        { text: 'Files', onPress: pickFromFiles },
+        { text: 'Cancel', style: 'cancel' },
+      ]);
+    }
+  }, [pickFromPhotos, pickFromCamera, pickFromFiles]);
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  };
+
   // ─── Send Message ─────────────────────────────────────────────────
   const sendMessage = useCallback(async () => {
-    if (!inputText.trim() || isGenerating) return;
+    if ((!inputText.trim() && !attachedFile) || isGenerating) return;
     Keyboard.dismiss();
     abortRef.current = false;
 
-    const userText = inputText.trim();
-    const userMsg: Message = { id: `u_${Date.now()}`, role: 'user', content: userText };
+    const userText = inputText.trim() || (attachedFile ? `Analyze this file: ${attachedFile.name}` : '');
+    const userMsg: Message = { id: `u_${Date.now()}`, role: 'user', content: userText, fileName: attachedFile?.name };
     const assistantMsg: Message = { id: `a_${Date.now() + 1}`, role: 'assistant', content: '' };
 
+    const currentFile = attachedFile;
     setMessages(prev => [...prev, userMsg, assistantMsg]);
     setInputText('');
+    setAttachedFile(null);
     setIsGenerating(true);
     setToolLog([]);
 
     try {
-      // Build Claude messages: existing history + new user message
-      const newClaudeMessages = [
-        ...claudeMessages,
-        { role: "user", content: userText }
-      ];
+      const newClaudeMessages = [...claudeMessages, { role: "user", content: userText }];
+      let data;
 
-      const res = await fetch(`${BACKEND_URL}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: newClaudeMessages }),
-      });
+      if (currentFile) {
+        // File upload via multipart form
+        const formData = new FormData();
+        formData.append('messages', JSON.stringify(newClaudeMessages));
+        formData.append('file', { uri: currentFile.uri, name: currentFile.name, type: currentFile.mimeType } as any);
 
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({ detail: 'Unknown error' }));
-        throw new Error(errData.detail || `HTTP ${res.status}`);
+        const res = await fetch(`${BACKEND_URL}/api/chat/with-file`, { method: 'POST', body: formData });
+        data = await res.json();
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      } else {
+        const res = await fetch(`${BACKEND_URL}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: newClaudeMessages }),
+        });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({ detail: 'Unknown error' }));
+          throw new Error(errData.detail || `HTTP ${res.status}`);
+        }
+        data = await res.json();
       }
-
-      const data = await res.json();
 
       if (data.type === 'device_tool') {
         // Backend needs us to execute a device tool
@@ -310,7 +387,7 @@ export default function JarvisChat() {
       });
       setIsGenerating(false);
     }
-  }, [inputText, isGenerating, claudeMessages, handleDeviceTool, saveConversation]);
+  }, [inputText, isGenerating, claudeMessages, attachedFile, handleDeviceTool, saveConversation]);
 
   // ─── Stop ─────────────────────────────────────────────────────────
   const handleStop = useCallback(() => {
@@ -400,6 +477,11 @@ export default function JarvisChat() {
               msg.role === 'system' ? styles.systemBubble :
               styles.aiBubble,
             ]}>
+              {msg.fileName && (
+                <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
+                  <Text style={{ fontSize: 12, color: '#FFF', opacity: 0.7 }}>📎 {msg.fileName}</Text>
+                </View>
+              )}
               <Text style={[
                 styles.msgText,
                 msg.role === 'user' && styles.userText,
@@ -427,7 +509,28 @@ export default function JarvisChat() {
 
       {/* Input Area */}
       <View style={[styles.inputArea, { paddingBottom: Math.max(insets.bottom, 10) + 4 }]}>
+        {attachedFile && (
+          <View style={styles.filePreview}>
+            {attachedFile.mimeType.startsWith('image/') ? (
+              <Image source={{ uri: attachedFile.uri }} style={styles.filePreviewImage} />
+            ) : (
+              <Text style={styles.filePreviewIcon}>
+                {attachedFile.mimeType.startsWith('video/') ? '🎬' : '📎'}
+              </Text>
+            )}
+            <View style={{ flex: 1 }}>
+              <Text style={styles.filePreviewName} numberOfLines={1}>{attachedFile.name}</Text>
+              <Text style={styles.filePreviewSize}>{formatFileSize(attachedFile.size)}</Text>
+            </View>
+            <TouchableOpacity onPress={() => setAttachedFile(null)} style={styles.fileRemoveBtn}>
+              <Text style={styles.fileRemoveText}>✕</Text>
+            </TouchableOpacity>
+          </View>
+        )}
         <View style={styles.inputRow}>
+          <TouchableOpacity style={styles.attachBtn} onPress={showAttachOptions} disabled={isGenerating}>
+            <Text style={[styles.attachIcon, isGenerating && { opacity: 0.3 }]}>+</Text>
+          </TouchableOpacity>
           <TextInput
             style={styles.input}
             placeholder="Message Jarvis..."
@@ -446,9 +549,9 @@ export default function JarvisChat() {
             </TouchableOpacity>
           ) : (
             <TouchableOpacity
-              style={[styles.sendBtn, !inputText.trim() && styles.sendBtnDisabled]}
+              style={[styles.sendBtn, (!inputText.trim() && !attachedFile) && styles.sendBtnDisabled]}
               onPress={sendMessage}
-              disabled={!inputText.trim()}
+              disabled={!inputText.trim() && !attachedFile}
             >
               <Text style={styles.sendBtnText}>↑</Text>
             </TouchableOpacity>
@@ -544,7 +647,27 @@ const styles = StyleSheet.create({
     backgroundColor: '#0A0A0F',
     borderTopWidth: 1, borderTopColor: '#1A1A25',
   },
+  filePreview: {
+    flexDirection: 'row', alignItems: 'center', backgroundColor: '#1A1A2E',
+    borderRadius: 12, padding: 10, marginBottom: 8,
+    borderWidth: 1, borderColor: '#00D9FF30',
+  },
+  filePreviewIcon: { fontSize: 20, marginRight: 10 },
+  filePreviewImage: { width: 44, height: 44, borderRadius: 8, marginRight: 10 },
+  filePreviewName: { fontSize: 14, color: '#FFF', fontWeight: '600' },
+  filePreviewSize: { fontSize: 11, color: '#888', marginTop: 2 },
+  fileRemoveBtn: {
+    width: 28, height: 28, borderRadius: 14, backgroundColor: '#FF4444',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  fileRemoveText: { fontSize: 14, color: '#FFF', fontWeight: '700' },
   inputRow: { flexDirection: 'row', alignItems: 'flex-end', gap: 8 },
+  attachBtn: {
+    width: 44, height: 44, borderRadius: 22, backgroundColor: '#1A1A2E',
+    alignItems: 'center', justifyContent: 'center',
+    borderWidth: 1, borderColor: '#2A2A3A',
+  },
+  attachIcon: { fontSize: 24, color: '#00D9FF', fontWeight: '300' },
   input: {
     flex: 1, backgroundColor: '#12121A',
     borderRadius: 24, paddingHorizontal: 18,
