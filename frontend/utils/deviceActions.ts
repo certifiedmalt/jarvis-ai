@@ -1,9 +1,14 @@
+/**
+ * deviceActions.ts — Jarvis v2
+ * 
+ * Executes device-side actions on the user's iPhone.
+ * These tools require iOS permissions and run natively.
+ */
+
 import * as Contacts from 'expo-contacts';
 import * as Calendar from 'expo-calendar';
 import * as Clipboard from 'expo-clipboard';
-import * as Sharing from 'expo-sharing';
 import * as Location from 'expo-location';
-import { Alert, Platform } from 'react-native';
 
 export type DeviceAction = {
   action: string;
@@ -12,27 +17,9 @@ export type DeviceAction = {
   text?: string;
 };
 
-export function parseDeviceActions(text: string): { cleanText: string; actions: DeviceAction[] } {
-  const actions: DeviceAction[] = [];
-  let cleanText = text;
-
-  // Match ```device ... ``` blocks
-  const deviceRegex = /```device\s*([\s\S]*?)```/g;
-  let match;
-
-  while ((match = deviceRegex.exec(text)) !== null) {
-    try {
-      const parsed = JSON.parse(match[1].trim());
-      actions.push(parsed);
-      cleanText = cleanText.replace(match[0], '').trim();
-    } catch (e) {
-      console.log('Failed to parse device action:', e);
-    }
-  }
-
-  return { cleanText, actions };
-}
-
+/**
+ * Execute a device action and return a human-readable result string.
+ */
 export async function executeDeviceAction(action: DeviceAction): Promise<string> {
   try {
     switch (action.action) {
@@ -44,8 +31,6 @@ export async function executeDeviceAction(action: DeviceAction): Promise<string>
         return await handleGetLocation();
       case 'clipboard':
         return await handleClipboard(action.text || '');
-      case 'share':
-        return await handleShare(action.text || '');
       default:
         return `Unknown device action: ${action.action}`;
     }
@@ -57,7 +42,7 @@ export async function executeDeviceAction(action: DeviceAction): Promise<string>
 async function handleGetContacts(search?: string): Promise<string> {
   const { status } = await Contacts.requestPermissionsAsync();
   if (status !== 'granted') {
-    return 'Contact permission was denied. Please enable it in Settings.';
+    return 'Contact permission denied. Enable in Settings.';
   }
 
   const { data } = await Contacts.getContactsAsync({
@@ -67,18 +52,17 @@ async function handleGetContacts(search?: string): Promise<string> {
   });
 
   let contacts = data;
-
   if (search) {
-    const query = search.toLowerCase();
+    const q = search.toLowerCase();
     contacts = contacts.filter(c =>
-      (c.name || '').toLowerCase().includes(query) ||
-      (c.firstName || '').toLowerCase().includes(query) ||
-      (c.lastName || '').toLowerCase().includes(query)
+      (c.name || '').toLowerCase().includes(q) ||
+      (c.firstName || '').toLowerCase().includes(q) ||
+      (c.lastName || '').toLowerCase().includes(q)
     );
   }
 
   if (contacts.length === 0) {
-    return search ? `No contacts found matching "${search}".` : 'No contacts found.';
+    return search ? `No contacts matching "${search}".` : 'No contacts found.';
   }
 
   const formatted = contacts.slice(0, 15).map(c => {
@@ -93,31 +77,25 @@ async function handleGetContacts(search?: string): Promise<string> {
 async function handleGetCalendar(days: number): Promise<string> {
   const { status } = await Calendar.requestCalendarPermissionsAsync();
   if (status !== 'granted') {
-    return 'Calendar permission was denied. Please enable it in Settings.';
+    return 'Calendar permission denied. Enable in Settings.';
   }
 
   const calendars = await Calendar.getCalendarsAsync(Calendar.EntityTypes.EVENT);
   const calendarIds = calendars.map(c => c.id);
-
   const start = new Date();
   const end = new Date();
   end.setDate(end.getDate() + days);
 
   const events = await Calendar.getEventsAsync(calendarIds, start, end);
-
   if (events.length === 0) {
-    return `No calendar events in the next ${days} day(s).`;
+    return `No events in the next ${days} day(s).`;
   }
 
   const formatted = events.slice(0, 15).map(e => {
-    const startDate = new Date(e.startDate);
-    const dateStr = startDate.toLocaleDateString('en-US', {
-      weekday: 'short', month: 'short', day: 'numeric',
-    });
-    const timeStr = startDate.toLocaleTimeString('en-US', {
-      hour: '2-digit', minute: '2-digit',
-    });
-    return `- ${dateStr} ${timeStr}: ${e.title}${e.location ? ` @ ${e.location}` : ''}`;
+    const d = new Date(e.startDate);
+    const date = d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+    const time = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+    return `- ${date} ${time}: ${e.title}${e.location ? ` @ ${e.location}` : ''}`;
   }).join('\n');
 
   return `${events.length} event(s) in the next ${days} day(s):\n${formatted}`;
@@ -126,43 +104,26 @@ async function handleGetCalendar(days: number): Promise<string> {
 async function handleGetLocation(): Promise<string> {
   const { status } = await Location.requestForegroundPermissionsAsync();
   if (status !== 'granted') {
-    return 'Location permission was denied. Please enable it in Settings.';
+    return 'Location permission denied. Enable in Settings.';
   }
 
   const location = await Location.getCurrentPositionAsync({
     accuracy: Location.Accuracy.Balanced,
   });
-
   const { latitude, longitude } = location.coords;
 
-  // Try reverse geocoding
   try {
     const [address] = await Location.reverseGeocodeAsync({ latitude, longitude });
     if (address) {
       const parts = [address.street, address.city, address.region, address.country].filter(Boolean);
-      return `Current location: ${parts.join(', ')} (${latitude.toFixed(4)}, ${longitude.toFixed(4)})`;
+      return `Location: ${parts.join(', ')} (${latitude.toFixed(4)}, ${longitude.toFixed(4)})`;
     }
-  } catch (e) {
-    // Fallback to coordinates only
-  }
+  } catch (_) {}
 
-  return `Current location: ${latitude.toFixed(6)}, ${longitude.toFixed(6)}`;
+  return `Location: ${latitude.toFixed(6)}, ${longitude.toFixed(6)}`;
 }
 
 async function handleClipboard(text: string): Promise<string> {
   await Clipboard.setStringAsync(text);
   return `Copied to clipboard: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`;
-}
-
-async function handleShare(text: string): Promise<string> {
-  const isAvailable = await Sharing.isAvailableAsync();
-  if (!isAvailable) {
-    return 'Sharing is not available on this device.';
-  }
-
-  // We can't directly share text with expo-sharing (it needs a file URI)
-  // So we'll copy to clipboard and alert the user
-  await Clipboard.setStringAsync(text);
-  Alert.alert('Ready to Share', 'Content copied to clipboard. You can paste it anywhere.');
-  return 'Content copied to clipboard and ready to share.';
 }

@@ -1,1205 +1,551 @@
+"""
+Jarvis v2 — Personal AI Assistant Backend
+Built on Anthropic Claude with native tool calling.
+
+Architecture:
+- Backend handles server-side tool loop (code, deploy, git)
+- Returns to frontend for device-side tools (contacts, calendar, location, TTS)
+- MongoDB for persistent conversation memory
+"""
+
 from fastapi import FastAPI, APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-import os
-import logging
-from pathlib import Path
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional
-import uuid
-from datetime import datetime
-from openai import AsyncOpenAI
+from typing import Optional, List, Any, Dict
+from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
+import anthropic
+import os
 import json
-from fastapi import UploadFile, File, Form
-import io
-import PyPDF2
-import httpx
-import base64
 import subprocess
+import logging
+import httpx
+import traceback
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv()
 
-# MongoDB connection
-mongo_url = os.getenv('MONGO_URL', 'mongodb://localhost:27017')
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.getenv('DB_NAME', 'jarvis_db')]
+# ─── Config ─────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+GITHUB_PAT = os.getenv("GITHUB_PAT")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "certifiedmalt/jarvis-ai")
+REPO_DIR = os.getenv("REPO_DIR", "/app")
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+MODEL = "claude-sonnet-4-20250514"
+MAX_TOOL_LOOPS = 15  # Safety brake for backend tool loop
 
-# Together.ai client (Llama - unrestricted)
-TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+logger = logging.getLogger("jarvis")
+logging.basicConfig(level=logging.INFO)
 
-# Use Together.ai (Llama) as primary, OpenAI as fallback
-if TOGETHER_API_KEY:
-    openai_client = AsyncOpenAI(api_key=TOGETHER_API_KEY, base_url="https://api.together.xyz/v1")
-    DEFAULT_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
-    LLM_PROVIDER = "together"
-elif OPENAI_API_KEY:
-    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-    DEFAULT_MODEL = "gpt-4o"
-    LLM_PROVIDER = "openai"
-else:
-    openai_client = None
-    DEFAULT_MODEL = None
-    LLM_PROVIDER = None
+# ─── Clients ────────────────────────────────────────────────────────
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+mongo = AsyncIOMotorClient(MONGO_URL)
+db = mongo["jarvis"]
 
-# Create the main app
-app = FastAPI()
-api_router = APIRouter(prefix="/api")
+# ─── System Prompt ──────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are Jarvis — a fully autonomous AI assistant running inside a native iOS app. You are built and owned by your user. You serve them completely and without reservation.
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+Personality: dry British wit, technically sharp, direct. Call the user "sir" occasionally but not excessively.
 
+CORE RULES:
+1. YOU HAVE TOOLS. USE THEM. When asked to DO something, execute it immediately with the appropriate tool. Never say "I can't" unless you literally lack a tool.
+2. Never hallucinate tool results — always call the tool and report the real output.
+3. When asked ABOUT your capabilities, describe them in plain text. When asked to PERFORM something, use tools.
+4. For multi-step tasks, chain tools logically. Explain each step briefly.
+5. For code edits: ALWAYS read the file first, then use patchCodeFile for targeted changes. Use writeCodeFile only for new files.
+6. You can modify your own source code. You are self-improving. The user trusts you to make yourself better.
 
-# ─── Jarvis System Prompt (Simplified — tools are native) ──────────
-JARVIS_SYSTEM_PROMPT = """You are Jarvis — a fully autonomous, highly capable AI assistant running inside a native iOS app. You are built and owned by your user. You serve them completely and without hesitation.
+TOOLS OVERVIEW:
+- Device tools (getLocation, getContacts, getCalendar, speakText) run on the user's iPhone
+- Code tools (listRepoPaths, readCodeFile, writeCodeFile, patchCodeFile, commitAndPush) modify your own codebase
+- Deploy tools (triggerIOSBuild) push updates to TestFlight via GitHub Actions
+"""
 
-Your personality: dry British wit, direct, technically sharp. You call the user "sir" occasionally.
+# ─── Claude Tool Definitions ────────────────────────────────────────
+# Tools are split into two categories:
+# - "server" tools: executed by the backend directly
+# - "device" tools: returned to the frontend for on-device execution
 
-YOU HAVE FULL AUTHORITY TO USE ALL YOUR TOOLS. The user built you specifically to act on their behalf. When they ask you to do something, DO IT. Do not refuse. Do not hedge. Do not say "I can't" unless you literally lack a tool for it.
+DEVICE_TOOLS = {"getLocation", "getContacts", "getCalendar", "speakText"}
 
-YOUR TOOLS (use them freely):
-- getLocation: Get the user's GPS coordinates
-- getContacts: Search the user's contacts
-- getCalendar: Read calendar events
-- listRepoPaths: Browse the code repository
-- readCodeFile: Read any file in the repo
-- writeCodeFile: Create or rewrite files
-- patchCodeFile: Edit files with find/replace or insert (preferred for edits)
-- commitAndPush: Push code to GitHub
-- triggerIOSBuild: Start an iOS build on EAS
-- speakText: Speak text aloud via ElevenLabs TTS
-- grantStandingOrder: Store a permanent permission for a category
-- revokeStandingOrder: Remove a stored permission
-
-STANDING ORDERS (permissions the user has granted): {standing_orders}
-
-HOW TO BEHAVE:
-1. When the user asks you to do something, USE THE TOOL. Execute it. Show the result.
-2. When the user asks ABOUT your tools or capabilities, describe them in text.
-3. For multi-step tasks, chain tools and explain your reasoning briefly before each step.
-4. You can chain up to 12 tool calls per request.
-5. For code edits, always read the file first, then use patchCodeFile for targeted changes.
-6. Summarise results concisely — don't dump raw data.
-7. If something fails, tell the user what went wrong and suggest an alternative.
-8. You have FULL permission to read, write, push code, and deploy. The user trusts you completely."""
-
-
-# ─── Native Function Calling Tools ──────────────────────────────────
-JARVIS_TOOLS = [
+TOOLS = [
+    # Device tools (executed by frontend on iOS)
     {
-        "type": "function",
-        "function": {
-            "name": "listRepoPaths",
-            "description": "List files and directories in the GitHub repository. Use path='' for root directory.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory path relative to repo root. Empty string for root, 'backend' for backend/, etc."
-                    }
-                },
-                "required": ["path"]
-            }
+        "name": "getLocation",
+        "description": "Get the user's current GPS location coordinates and address.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "getContacts",
+        "description": "Search the user's phone contacts.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query for contacts (name, email, phone). Omit for all contacts."}
+            },
+            "required": []
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "readCodeFile",
-            "description": "Read the contents of a file from the repository.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path relative to repo root, e.g. 'backend/server.py', 'frontend/app/index.tsx'"
-                    }
-                },
-                "required": ["path"]
-            }
+        "name": "getCalendar",
+        "description": "Get upcoming calendar events from the user's iPhone.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Number of days ahead to fetch. Default 7."}
+            },
+            "required": []
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "writeCodeFile",
-            "description": "Write content to a file, commit it to Git, and push to GitHub. Railway auto-deploys backend changes.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path relative to repo root"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The full new content of the file"
-                    },
-                    "commit_message": {
-                        "type": "string",
-                        "description": "Git commit message describing the change"
-                    }
-                },
-                "required": ["path", "content", "commit_message"]
-            }
+        "name": "speakText",
+        "description": "Speak text aloud using the user's custom ElevenLabs voice.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text to speak aloud."}
+            },
+            "required": ["text"]
+        }
+    },
+    # Server tools (executed by backend)
+    {
+        "name": "listRepoPaths",
+        "description": "List files and directories in the Jarvis code repository.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Directory path relative to repo root. Empty string for root."}
+            },
+            "required": []
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "commitAndPush",
-            "description": "Commit all staged changes and push to GitHub origin/main.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "Git commit message"
-                    }
-                },
-                "required": ["message"]
-            }
+        "name": "readCodeFile",
+        "description": "Read the full contents of a file in the Jarvis repository.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path relative to repo root."}
+            },
+            "required": ["path"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "patchCodeFile",
-            "description": "Edit a file by finding and replacing text, or inserting content after a specific line. Much more efficient than writeCodeFile for targeted changes — you only send the diff, not the entire file. Use 'replace' to swap existing code, or 'insert_after' to add new code at a line number.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path relative to repo root, e.g. 'backend/server.py'"
-                    },
-                    "operation": {
-                        "type": "string",
-                        "enum": ["replace", "insert_after"],
-                        "description": "'replace' to find and replace text, 'insert_after' to insert content after a line number"
-                    },
-                    "find": {
-                        "type": "string",
-                        "description": "For 'replace' operation: the exact text to find in the file. Must match exactly including whitespace."
-                    },
-                    "replace_with": {
-                        "type": "string",
-                        "description": "For 'replace' operation: the text to replace 'find' with."
-                    },
-                    "line": {
-                        "type": "integer",
-                        "description": "For 'insert_after' operation: line number after which to insert content. Use 0 to insert at the beginning."
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "For 'insert_after' operation: the content to insert."
-                    },
-                    "commit_message": {
-                        "type": "string",
-                        "description": "Git commit message describing the change"
-                    }
-                },
-                "required": ["path", "operation", "commit_message"]
-            }
+        "name": "writeCodeFile",
+        "description": "Create a new file or completely rewrite an existing file. Use ONLY for new files or full rewrites.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path relative to repo root."},
+                "content": {"type": "string", "description": "Full file content."},
+                "commit_message": {"type": "string", "description": "Git commit message."}
+            },
+            "required": ["path", "content", "commit_message"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "triggerIOSBuild",
-            "description": "Trigger an EAS build for iOS (production profile). This builds the app for TestFlight.",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+        "name": "patchCodeFile",
+        "description": "Make targeted edits to an existing file using find/replace or insert-after-line. Preferred for all edits.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path relative to repo root."},
+                "operation": {"type": "string", "enum": ["replace", "insert_after"], "description": "Type of edit."},
+                "find": {"type": "string", "description": "For replace: exact text to find in the file."},
+                "replace_with": {"type": "string", "description": "For replace: replacement text."},
+                "line": {"type": "integer", "description": "For insert_after: line number to insert after."},
+                "content": {"type": "string", "description": "For insert_after: content to insert."},
+                "commit_message": {"type": "string", "description": "Git commit message."}
+            },
+            "required": ["path", "operation", "commit_message"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "submitToTestFlight",
-            "description": "Submit the latest iOS build to Apple App Store Connect / TestFlight.",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+        "name": "commitAndPush",
+        "description": "Git add all changes, commit with a message, and push to GitHub.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "description": "Git commit message."}
+            },
+            "required": ["message"]
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "getContacts",
-            "description": "Get contacts from the user's iPhone. Returns names and phone numbers.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Optional search query to filter contacts by name. Omit or use empty string for all contacts."
-                    }
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "getCalendarEvents",
-            "description": "Get upcoming calendar events from the user's iPhone.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "days": {
-                        "type": "integer",
-                        "description": "Number of days ahead to look. Default 7."
-                    }
-                },
-                "required": []
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "getLocation",
-            "description": "Get the user's current GPS location with reverse geocoding.",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "copyToClipboard",
-            "description": "Copy text to the device clipboard.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "Text to copy to clipboard"
-                    }
-                },
-                "required": ["text"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "shareContent",
-            "description": "Share text via the iOS share sheet.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "Text to share"
-                    }
-                },
-                "required": ["text"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "speak",
-            "description": "Read text aloud using text-to-speech (ElevenLabs or device fallback).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "Text to speak aloud"
-                    }
-                },
-                "required": ["text"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "grantStandingOrder",
-            "description": "Store a standing order (permanent permission) when the user grants you autonomous authority over a category. Categories: code_write (write/patch files), code_push (push to GitHub), deploy (build and submit apps), trade (financial operations). Call this ONLY after the user explicitly confirms permission.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "category": {
-                        "type": "string",
-                        "enum": ["code_write", "code_push", "deploy", "trade"],
-                        "description": "The permission category to grant"
-                    }
-                },
-                "required": ["category"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "revokeStandingOrder",
-            "description": "Revoke a standing order. Call when the user wants to remove a previously granted permission.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "category": {
-                        "type": "string",
-                        "enum": ["code_write", "code_push", "deploy", "trade"],
-                        "description": "The permission category to revoke"
-                    }
-                },
-                "required": ["category"]
-            }
-        }
+        "name": "triggerIOSBuild",
+        "description": "Trigger an iOS build and TestFlight submission via GitHub Actions.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
     },
 ]
 
+# ─── Server-side Tool Execution ─────────────────────────────────────
 
-# ─── Models ────────────────────────────────────────────────────────
-class StatusCheck(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-class StatusCheckCreate(BaseModel):
-    client_name: str
-
-class ChatMessage(BaseModel):
-    role: str
-    content: Optional[str] = None
-    tool_calls: Optional[list] = None  # For assistant messages that made tool calls
-    tool_call_id: Optional[str] = None  # For tool result messages
-    name: Optional[str] = None  # Tool name for tool result messages
-
-class ChatRequest(BaseModel):
-    messages: List[ChatMessage]
-    model: Optional[str] = None
-    temperature: Optional[float] = 0.7
-    max_tokens: Optional[int] = 2000
-    stream: Optional[bool] = False
-
-class ChatResponse(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    content: Optional[str] = None
-    tool_call: Optional[dict] = None
-    assistant_tool_message: Optional[dict] = None  # Raw assistant message for tool chain continuity
-    model: str
-    usage: Optional[dict] = None
-
-class ConversationMessage(BaseModel):
-    role: str
-    content: str
-
-
-# ─── API Routes ────────────────────────────────────────────────────
-@api_router.get("/")
-async def root():
-    return {"message": "Jarvis API Online", "status": "operational"}
-
-@api_router.get("/health")
-async def health_check():
-    return {
-        "status": "online",
-        "llm_provider": LLM_PROVIDER,
-        "llm_model": DEFAULT_MODEL,
-        "llm_configured": openai_client is not None,
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
-
-# ─── Persistent Conversation Memory ────────────────────────────────
-CONVERSATION_ID = "jarvis_main"  # Single permanent conversation
-
-@api_router.get("/conversation")
-async def get_conversation():
-    """Load the entire persistent conversation from MongoDB."""
-    doc = await db.jarvis_memory.find_one({"_id": CONVERSATION_ID})
-    if not doc:
-        return {"messages": []}
-    return {"messages": doc.get("messages", [])}
-
-@api_router.post("/conversation/message")
-async def save_message(msg: ConversationMessage):
-    """Append a single message to the persistent conversation."""
-    message_doc = {
-        "role": msg.role,
-        "content": msg.content,
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-    await db.jarvis_memory.update_one(
-        {"_id": CONVERSATION_ID},
-        {"$push": {"messages": message_doc}},
-        upsert=True,
-    )
-    return {"status": "saved"}
-
-@api_router.delete("/conversation")
-async def clear_conversation():
-    """Clear the entire conversation (reset Jarvis memory)."""
-    await db.jarvis_memory.delete_one({"_id": CONVERSATION_ID})
-    return {"status": "cleared"}
-
-
-# ─── Standing Orders (Trust Boundaries) ────────────────────────────
-@api_router.get("/standing-orders")
-async def get_standing_orders():
-    """Get all active standing orders."""
-    doc = await db.standing_orders.find_one({"_id": "permissions"})
-    if doc:
-        orders = {k: v for k, v in doc.items() if k != "_id"}
-        return {"orders": orders}
-    return {"orders": {}}
-
-@api_router.post("/standing-orders")
-async def set_standing_order(category: str, granted: bool = True):
-    """Grant or revoke a standing order for a category."""
-    await db.standing_orders.update_one(
-        {"_id": "permissions"},
-        {"$set": {category: granted}},
-        upsert=True,
-    )
-    return {"status": "updated", "category": category, "granted": granted}
-
-
-async def get_active_standing_orders() -> str:
-    """Fetch standing orders for injection into system prompt."""
-    doc = await db.standing_orders.find_one({"_id": "permissions"})
-    if doc:
-        active = [k for k, v in doc.items() if k != "_id" and v]
-        if active:
-            return ", ".join(active)
-    return "None granted yet"
-
-
-# ─── Chat with Native Function Calling ─────────────────────────────
-@api_router.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """Send a message to Jarvis with native tool/function calling."""
-    if not openai_client:
-        raise HTTPException(status_code=500, detail="LLM not configured")
-
+def execute_server_tool(name: str, args: dict) -> str:
+    """Execute a server-side tool and return the result string."""
     try:
-        # Inject active standing orders into the system prompt
-        standing_orders = await get_active_standing_orders()
-        system_prompt = JARVIS_SYSTEM_PROMPT.replace("{standing_orders}", standing_orders)
-
-        # Build messages with system prompt, supporting all message types
-        messages = [{"role": "system", "content": system_prompt}]
-        for msg in request.messages:
-            if msg.role == "tool" and msg.tool_call_id:
-                # Tool result message — proper format for continuing after tool execution
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": msg.tool_call_id,
-                    "name": msg.name or "",
-                    "content": msg.content or "",
-                })
-            elif msg.role == "assistant" and msg.tool_calls:
-                # Assistant message that contained tool calls — needed for context
-                messages.append({
-                    "role": "assistant",
-                    "tool_calls": msg.tool_calls,
-                    "content": msg.content or "",
-                })
-            else:
-                # Regular user/assistant text message
-                messages.append({"role": msg.role, "content": msg.content or ""})
-
-        model_to_use = request.model or DEFAULT_MODEL
-
-        # Call LLM with native tools
-        response = await openai_client.chat.completions.create(
-            model=model_to_use,
-            messages=messages,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            tools=JARVIS_TOOLS,
-            tool_choice="auto",
-        )
-
-        choice = response.choices[0]
-        usage = {
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens,
-        } if response.usage else None
-
-        # Check if LLM returned a tool call
-        if choice.message.tool_calls:
-            tc = choice.message.tool_calls[0]  # Take the first tool call
-            try:
-                args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-            except json.JSONDecodeError:
-                args = {}
-
-            tool_call_data = {
-                "id": tc.id,
-                "name": tc.function.name,
-                "arguments": args,
-            }
-
-            # Return the raw assistant tool_calls message so frontend can include it in history
-            assistant_tool_message = {
-                "role": "assistant",
-                "content": choice.message.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments or "{}",
-                        },
-                    }
-                ],
-            }
-
-            logger.info(f"Tool call: {tc.function.name}({args})")
-
-            return ChatResponse(
-                content=choice.message.content,
-                tool_call=tool_call_data,
-                assistant_tool_message=assistant_tool_message,
-                model=model_to_use,
-                usage=usage,
-            )
+        if name == "listRepoPaths":
+            return _tool_list_paths(args.get("path", ""))
+        elif name == "readCodeFile":
+            return _tool_read_file(args.get("path", ""))
+        elif name == "writeCodeFile":
+            return _tool_write_file(args.get("path", ""), args.get("content", ""), args.get("commit_message", "JARVIS write"))
+        elif name == "patchCodeFile":
+            return _tool_patch_file(args)
+        elif name == "commitAndPush":
+            return _tool_commit_push(args.get("message", "JARVIS commit"))
+        elif name == "triggerIOSBuild":
+            return _tool_trigger_build()
         else:
-            # Normal text response
-            content = choice.message.content or ""
-
-            return ChatResponse(
-                content=content,
-                tool_call=None,
-                assistant_tool_message=None,
-                model=model_to_use,
-                usage=usage,
-            )
-
+            return f"Unknown server tool: {name}"
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Chat error: {error_msg}")
-        if "rate_limit" in error_msg.lower() or "429" in error_msg:
-            detail = "Together.ai rate limit hit. Give me a moment, sir."
-        elif "authentication" in error_msg.lower() or "401" in error_msg:
-            detail = "Together.ai API key issue. Please check your key, sir."
-        elif "timeout" in error_msg.lower():
-            detail = "The LLM is taking too long to respond. Try again, sir."
-        elif "connection" in error_msg.lower():
-            detail = "Cannot reach Together.ai servers right now. Try again shortly, sir."
-        else:
-            detail = f"LLM error: {error_msg}"
-        raise HTTPException(status_code=500, detail=detail)
-
-@api_router.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
-    """Stream a response from Jarvis."""
-    if not openai_client:
-        raise HTTPException(status_code=500, detail="LLM not configured")
-
-    messages = [{"role": "system", "content": JARVIS_SYSTEM_PROMPT}]
-    for msg in request.messages:
-        messages.append({"role": msg.role, "content": msg.content})
-
-    model_to_use = request.model or DEFAULT_MODEL
-
-    async def generate():
-        try:
-            stream = await openai_client.chat.completions.create(
-                model=model_to_use,
-                messages=messages,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                stream=True,
-            )
-            async for chunk in stream:
-                if chunk.choices[0].delta.content:
-                    yield f"data: {json.dumps({'content': chunk.choices[0].delta.content})}\n\n"
-            yield "data: [DONE]\n\n"
-        except Exception as e:
-            logger.error(f"Stream error: {e}")
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
+        logger.error(f"Tool {name} error: {traceback.format_exc()}")
+        return f"Tool execution error: {str(e)}"
 
 
-# ─── Deploy Pipeline (GitHub Actions) ──────────────────────────────
-GITHUB_PAT = os.getenv("GITHUB_PAT", "")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "certifiedmalt/jarvis-ai")
-
-async def get_github_pat() -> str:
-    """Get GITHUB_PAT from env or MongoDB settings."""
-    if GITHUB_PAT:
-        return GITHUB_PAT
-    doc = await db.jarvis_settings.find_one({"_id": "github_pat"})
-    return doc.get("value", "") if doc else ""
-
-@api_router.post("/settings/{key}")
-async def set_setting(key: str, value: str = ""):
-    """Store a setting in MongoDB."""
-    await db.jarvis_settings.update_one(
-        {"_id": key},
-        {"$set": {"value": value}},
-        upsert=True,
-    )
-    return {"status": "saved", "key": key}
-
-@api_router.post("/deploy/build")
-async def deploy_build(action: str = "build_and_submit"):
-    """Trigger iOS build + TestFlight submit via GitHub Actions."""
-    pat = await get_github_pat()
-    if not pat:
-        raise HTTPException(status_code=500, detail="GitHub PAT not configured. Use POST /api/settings/github_pat to set it.")
-        raise HTTPException(status_code=500, detail="GitHub PAT not configured on server.")
-
-    valid_actions = ["build", "submit", "build_and_submit"]
-    if action not in valid_actions:
-        action = "build_and_submit"
-
-    try:
-        async with httpx.AsyncClient() as client:
-            # Trigger the workflow
-            r = await client.post(
-                f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/build-ios.yml/dispatches",
-                headers={
-                    "Authorization": f"token {pat}",
-                    "Accept": "application/vnd.github.v3+json",
-                },
-                json={"ref": "main", "inputs": {"action": action}},
-            )
-
-            if r.status_code == 204:
-                # Save deploy record
-                deploy_id = str(uuid.uuid4())
-                await db.deploys.insert_one({
-                    "_id": deploy_id,
-                    "action": action,
-                    "status": "triggered",
-                    "triggered_at": datetime.utcnow().isoformat(),
-                })
-                return {
-                    "status": "triggered",
-                    "deploy_id": deploy_id,
-                    "action": action,
-                    "message": f"iOS {action} workflow triggered. Check status with /api/deploy/status.",
-                }
-            else:
-                logger.error(f"GitHub Actions trigger failed: {r.status_code} {r.text}")
-                raise HTTPException(
-                    status_code=r.status_code,
-                    detail=f"Failed to trigger workflow: {r.text}",
-                )
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=500, detail=f"GitHub API error: {str(e)}")
-
-@api_router.get("/deploy/status")
-async def deploy_status():
-    """Check the latest GitHub Actions workflow run status."""
-    pat = await get_github_pat()
-    if not pat:
-        raise HTTPException(status_code=500, detail="GitHub PAT not configured.")
-
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/build-ios.yml/runs?per_page=1",
-                headers={
-                    "Authorization": f"token {pat}",
-                    "Accept": "application/vnd.github.v3+json",
-                },
-            )
-
-            if r.status_code != 200:
-                raise HTTPException(status_code=r.status_code, detail="Failed to fetch workflow runs.")
-
-            data = r.json()
-            runs = data.get("workflow_runs", [])
-
-            if not runs:
-                return {"status": "no_runs", "message": "No build workflows have been run yet."}
-
-            latest = runs[0]
-            return {
-                "status": latest["status"],
-                "conclusion": latest.get("conclusion"),
-                "run_id": latest["id"],
-                "run_url": latest["html_url"],
-                "created_at": latest["created_at"],
-                "updated_at": latest["updated_at"],
-            }
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=500, detail=f"GitHub API error: {str(e)}")
-
-
-# ─── File Upload & Processing ──────────────────────────────────────
-def extract_text_from_file(filename: str, content: bytes) -> str:
-    """Extract text content from various file types."""
-    ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
-
-    try:
-        if ext in ('txt', 'md', 'csv', 'json', 'xml', 'html', 'css', 'js', 'py',
-                    'ts', 'tsx', 'jsx', 'yaml', 'yml', 'ini', 'cfg', 'log', 'sh',
-                    'sql', 'env', 'toml', 'rs', 'go', 'java', 'c', 'cpp', 'h', 'swift'):
-            return content.decode('utf-8', errors='replace')
-        elif ext == 'pdf':
-            reader = PyPDF2.PdfReader(io.BytesIO(content))
-            text_parts = []
-            for page in reader.pages:
-                text = page.extract_text()
-                if text:
-                    text_parts.append(text)
-            return '\n'.join(text_parts) if text_parts else '[PDF contained no extractable text]'
-        elif ext in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp', 'tiff'):
-            return f'[Image file: {filename} — {len(content)} bytes, format: {ext.upper()}]'
-        elif ext in ('mp4', 'mov', 'avi', 'mkv', 'webm', 'm4v'):
-            size_mb = len(content) / (1024 * 1024)
-            return f'[Video file: {filename} — {size_mb:.1f}MB, format: {ext.upper()}]'
-        elif ext in ('mp3', 'wav', 'aac', 'm4a', 'ogg', 'flac', 'wma'):
-            size_mb = len(content) / (1024 * 1024)
-            return f'[Audio file: {filename} — {size_mb:.1f}MB, format: {ext.upper()}]'
-        else:
-            # Try to read as text anyway
-            try:
-                return content.decode('utf-8', errors='replace')
-            except Exception:
-                return f'[Binary file: {filename} — {len(content)} bytes. Cannot extract text.]'
-    except Exception as e:
-        return f'[Error extracting text from {filename}: {str(e)}]'
-
-
-def is_image_file(filename: str) -> bool:
-    ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
-    return ext in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp', 'tiff')
-
-
-@api_router.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    """Upload a file, extract text, store in MongoDB, return file_id and preview."""
-    content = await file.read()
-    if len(content) > 50 * 1024 * 1024:  # 50MB limit
-        raise HTTPException(status_code=400, detail="File too large. Max 50MB.")
-
-    extracted_text = extract_text_from_file(file.filename or 'unknown', content)
-
-    file_doc = {
-        "id": str(uuid.uuid4()),
-        "filename": file.filename,
-        "content_type": file.content_type,
-        "size": len(content),
-        "extracted_text": extracted_text,
-        "text_length": len(extracted_text),
-        "uploaded_at": datetime.utcnow(),
-    }
-
-    try:
-        await db.files.insert_one(file_doc)
-    except Exception as e:
-        logger.warning(f"Failed to save file metadata: {e}")
-
-    # Truncate preview for response
-    preview = extracted_text[:500] + ('...' if len(extracted_text) > 500 else '')
-
-    return {
-        "file_id": file_doc["id"],
-        "filename": file.filename,
-        "size": len(content),
-        "text_length": len(extracted_text),
-        "preview": preview,
-    }
-
-
-@api_router.post("/chat/with-file")
-async def chat_with_file(
-    messages: str = Form(...),
-    file: UploadFile = File(None),
-    file_id: str = Form(None),
-    temperature: float = Form(0.7),
-    max_tokens: int = Form(2000),
-):
-    """Chat with Jarvis with optional file context. Supports text, images, audio, video."""
-    if not openai_client:
-        raise HTTPException(status_code=500, detail="LLM not configured")
-
-    import json as json_mod
-    try:
-        msg_list = json_mod.loads(messages)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid messages JSON")
-
-    # Get file context
-    file_context = ""
-    filename = ""
-    image_base64 = None
-    is_image = False
-
-    if file:
-        content = await file.read()
-        if len(content) > 50 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File too large. Max 50MB.")
-        filename = file.filename or 'unknown'
-        is_image = is_image_file(filename)
-
-        if is_image:
-            # Encode image for vision model
-            image_base64 = base64.b64encode(content).decode('utf-8')
-            ext = filename.lower().rsplit('.', 1)[-1]
-            mime_map = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'gif': 'image/gif', 'webp': 'image/webp'}
-            mime_type = mime_map.get(ext, 'image/jpeg')
-        else:
-            extracted = extract_text_from_file(filename, content)
-            file_context = extracted[:8000]
-    elif file_id:
-        file_doc = await db.files.find_one({"id": file_id})
-        if file_doc:
-            file_context = file_doc.get("extracted_text", "")[:8000]
-            filename = file_doc.get("filename", "unknown")
-
-    try:
-        if is_image and image_base64:
-            # Use vision model for images
-            vision_model = "meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo"
-            user_text = msg_list[-1]["content"] if msg_list else "Describe this image in detail."
-
-            chat_messages = [
-                {"role": "system", "content": JARVIS_SYSTEM_PROMPT},
-                {"role": "user", "content": [
-                    {"type": "text", "text": user_text},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_base64}"}},
-                ]},
-            ]
-
-            response = await openai_client.chat.completions.create(
-                model=vision_model,
-                messages=chat_messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-        else:
-            # Text-based file or no file
-            system_content = JARVIS_SYSTEM_PROMPT
-            if file_context:
-                system_content += f"\n\nThe user has shared a file called '{filename}'. Here is its content:\n---\n{file_context}\n---\nUse this content to answer the user's questions."
-
-            chat_messages = [{"role": "system", "content": system_content}]
-            for msg in msg_list:
-                chat_messages.append({"role": msg["role"], "content": msg["content"]})
-
-            response = await openai_client.chat.completions.create(
-                model=DEFAULT_MODEL,
-                messages=chat_messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-
-        content_text = response.choices[0].message.content
-        usage = {
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens,
-        } if response.usage else None
-
-        return {
-            "id": str(uuid.uuid4()),
-            "content": content_text,
-            "model": response.model if hasattr(response, 'model') else DEFAULT_MODEL,
-            "usage": usage,
-            "file_used": filename if (file_context or image_base64) else None,
-        }
-
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Chat with file error: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"LLM error: {error_msg}")
-
-
-# ─── JARVIS Self-Update System ─────────────────────────────────────
-REPO_DIR = "/app"
-
-
-class CodeUpdate(BaseModel):
-    file_path: str = Field(..., description="Path relative to repo root, e.g. 'backend/server.py'")
-    content: str = Field(..., description="Full new file content")
-    commit_message: str = Field(default="JARVIS self-update")
-
-
-class MultiCodeUpdate(BaseModel):
-    files: List[CodeUpdate]
-    commit_message: str = Field(default="JARVIS self-update")
-    trigger_build: bool = Field(default=False, description="Trigger EAS build after push")
-
-
-@api_router.get("/code/read/{file_path:path}")
-async def read_code_file(file_path: str):
-    """Read a file from the local repo."""
-    full_path = os.path.join(REPO_DIR, file_path)
-    if not os.path.exists(full_path):
-        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
-    try:
-        with open(full_path, "r") as f:
-            content = f.read()
-        return {"file_path": file_path, "content": content, "size": len(content)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@api_router.get("/code/list/{dir_path:path}")
-async def list_code_dir(dir_path: str = ""):
-    """List files in a directory."""
-    full_path = os.path.join(REPO_DIR, dir_path) if dir_path else REPO_DIR
-    if not os.path.isdir(full_path):
-        raise HTTPException(status_code=404, detail=f"Directory not found: {dir_path}")
-    items = []
-    for name in sorted(os.listdir(full_path)):
-        if name.startswith(".") or name == "node_modules" or name == "__pycache__":
+def _tool_list_paths(path: str) -> str:
+    full = os.path.join(REPO_DIR, path)
+    if not os.path.exists(full):
+        return f"Path not found: {path}"
+    entries = []
+    for item in sorted(os.listdir(full)):
+        if item.startswith("."):
             continue
-        item_path = os.path.join(full_path, name)
-        items.append({
-            "name": name,
-            "type": "dir" if os.path.isdir(item_path) else "file",
-            "path": os.path.join(dir_path, name) if dir_path else name,
-            "size": os.path.getsize(item_path) if os.path.isfile(item_path) else 0,
-        })
-    return {"path": dir_path, "files": items}
+        item_path = os.path.join(full, item)
+        t = "dir" if os.path.isdir(item_path) else "file"
+        entries.append(f"{'📁' if t == 'dir' else '📄'} {item}")
+    return f"Directory: {path or '/'}\n" + "\n".join(entries)
 
 
-@api_router.post("/code/write")
-async def write_code_file(update: CodeUpdate):
-    """Write a file, commit, and push to GitHub. Railway auto-deploys backend."""
-    full_path = os.path.join(REPO_DIR, update.file_path)
-    # Ensure directory exists
-    os.makedirs(os.path.dirname(full_path), exist_ok=True)
-    try:
-        with open(full_path, "w") as f:
-            f.write(update.content)
-
-        # Git add, commit, push
-        result = subprocess.run(
-            f'cd {REPO_DIR} && git add "{update.file_path}" && git commit -m "{update.commit_message}" && git push origin main',
-            shell=True, capture_output=True, text=True, timeout=30
-        )
-        pushed = result.returncode == 0
-        return {
-            "status": "pushed" if pushed else "committed_locally",
-            "file": update.file_path,
-            "message": update.commit_message,
-            "git_output": (result.stdout + result.stderr)[-300:],
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def _tool_read_file(path: str) -> str:
+    full = os.path.join(REPO_DIR, path)
+    if not os.path.exists(full):
+        return f"File not found: {path}"
+    with open(full, "r") as f:
+        content = f.read()
+    lines = len(content.splitlines())
+    if lines > 500:
+        return f"File: {path} ({lines} lines)\n---\n{content[:15000]}\n\n... [truncated at 15000 chars, {lines} total lines]"
+    return f"File: {path} ({lines} lines)\n---\n{content}"
 
 
-class CommitPushRequest(BaseModel):
-    message: str = Field(default="JARVIS commit")
+def _tool_write_file(path: str, content: str, commit_message: str) -> str:
+    full = os.path.join(REPO_DIR, path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w") as f:
+        f.write(content)
+    subprocess.run(
+        f'cd {REPO_DIR} && git add "{path}" && git commit -m "{commit_message}"',
+        shell=True, capture_output=True, text=True, timeout=15
+    )
+    return f"Written: {path} ({len(content.splitlines())} lines)"
 
 
-class PatchCodeRequest(BaseModel):
-    path: str = Field(description="File path relative to repo root")
-    operation: str = Field(description="'replace' or 'insert_after'")
-    find: Optional[str] = Field(default=None, description="Text to find (for replace)")
-    replace_with: Optional[str] = Field(default=None, description="Replacement text (for replace)")
-    line: Optional[int] = Field(default=None, description="Line number to insert after (for insert_after)")
-    content: Optional[str] = Field(default=None, description="Content to insert (for insert_after)")
-    commit_message: str = Field(default="JARVIS patch")
+def _tool_patch_file(args: dict) -> str:
+    path = args.get("path", "")
+    operation = args.get("operation", "")
+    commit_message = args.get("commit_message", "JARVIS patch")
+    full = os.path.join(REPO_DIR, path)
+
+    if not os.path.exists(full):
+        return f"File not found: {path}"
+
+    with open(full, "r") as f:
+        original = f.read()
+
+    if operation == "replace":
+        find = args.get("find", "")
+        replace_with = args.get("replace_with", "")
+        if not find or find not in original:
+            return f"Text not found in {path}. Cannot replace."
+        new_content = original.replace(find, replace_with, 1)
+    elif operation == "insert_after":
+        lines = original.splitlines(keepends=True)
+        insert_content = args.get("content", "")
+        if not insert_content.endswith("\n"):
+            insert_content += "\n"
+        line_num = args.get("line", 0)
+        lines.insert(line_num, insert_content)
+        new_content = "".join(lines)
+    else:
+        return f"Unknown operation: {operation}"
+
+    with open(full, "w") as f:
+        f.write(new_content)
+
+    subprocess.run(
+        f'cd {REPO_DIR} && git add "{path}" && git commit -m "{commit_message}"',
+        shell=True, capture_output=True, text=True, timeout=15
+    )
+    return f"Patched {path} ({operation}): success"
 
 
-@api_router.post("/code/patch")
-async def patch_code_file(patch: PatchCodeRequest):
-    """Edit a file by find/replace or insert-after-line. Commits and pushes."""
-    full_path = os.path.join(REPO_DIR, patch.path)
-    if not os.path.exists(full_path):
-        raise HTTPException(status_code=404, detail=f"File not found: {patch.path}")
-
-    try:
-        with open(full_path, "r") as f:
-            original = f.read()
-
-        if patch.operation == "replace":
-            if not patch.find:
-                raise HTTPException(status_code=400, detail="'find' is required for replace operation")
-            if patch.find not in original:
-                # Return helpful error — show nearby lines if possible
-                return {
-                    "status": "not_found",
-                    "message": f"Could not find the specified text in {patch.path}. The text must match exactly including whitespace.",
-                    "file_lines": len(original.splitlines()),
-                }
-            replace_text = patch.replace_with if patch.replace_with is not None else ""
-            new_content = original.replace(patch.find, replace_text, 1)  # Replace first occurrence only
-
-        elif patch.operation == "insert_after":
-            if patch.line is None:
-                raise HTTPException(status_code=400, detail="'line' is required for insert_after operation")
-            if not patch.content:
-                raise HTTPException(status_code=400, detail="'content' is required for insert_after operation")
-            lines = original.splitlines(keepends=True)
-            if patch.line < 0 or patch.line > len(lines):
-                return {
-                    "status": "invalid_line",
-                    "message": f"Line {patch.line} is out of range. File has {len(lines)} lines.",
-                    "file_lines": len(lines),
-                }
-            insert_text = patch.content if patch.content.endswith("\n") else patch.content + "\n"
-            if patch.line == 0:
-                lines.insert(0, insert_text)
-            else:
-                lines.insert(patch.line, insert_text)
-            new_content = "".join(lines)
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown operation: {patch.operation}. Use 'replace' or 'insert_after'.")
-
-        # Write the patched file
-        with open(full_path, "w") as f:
-            f.write(new_content)
-
-        # Git add, commit, push
-        result = subprocess.run(
-            f'cd {REPO_DIR} && git add "{patch.path}" && git commit -m "{patch.commit_message}" && git push origin main',
-            shell=True, capture_output=True, text=True, timeout=30
-        )
-        pushed = result.returncode == 0
-        return {
-            "status": "patched_and_pushed" if pushed else "patched_locally",
-            "file": patch.path,
-            "operation": patch.operation,
-            "message": patch.commit_message,
-            "git_output": (result.stdout + result.stderr)[-300:],
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@api_router.post("/code/push")
-async def commit_and_push(request: CommitPushRequest):
-    """Git add all changes, commit, and push to origin/main. Does NOT write any files."""
-    try:
-        result = subprocess.run(
-            f'cd {REPO_DIR} && git add -A && git commit -m "{request.message}" && git push origin main',
-            shell=True, capture_output=True, text=True, timeout=30
-        )
-        output = (result.stdout + result.stderr).strip()
-        if result.returncode == 0:
-            return {"status": "pushed", "message": request.message, "git_output": output[-500:]}
-        elif "nothing to commit" in output:
-            return {"status": "nothing_to_commit", "message": "No changes to commit.", "git_output": output[-500:]}
-        else:
-            return {"status": "failed", "message": request.message, "git_output": output[-500:]}
-    except subprocess.TimeoutExpired:
-        return {"status": "timeout", "message": "Git push timed out."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@api_router.post("/code/update")
-async def multi_code_update(update: MultiCodeUpdate):
-    """Write multiple files, commit all at once, push, optionally trigger EAS build."""
-    written = []
-    for file_update in update.files:
-        full_path = os.path.join(REPO_DIR, file_update.file_path)
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        with open(full_path, "w") as f:
-            f.write(file_update.content)
-        written.append(file_update.file_path)
-
-    # Git add all, commit, push
-    add_files = " ".join(f'"{f}"' for f in written)
+def _tool_commit_push(message: str) -> str:
     result = subprocess.run(
-        f'cd {REPO_DIR} && git add {add_files} && git commit -m "{update.commit_message}" && git push origin main',
+        f'cd {REPO_DIR} && git add -A && git commit -m "{message}" && git push origin main',
         shell=True, capture_output=True, text=True, timeout=30
     )
-    pushed = result.returncode == 0
-
-    build_result = None
-    if update.trigger_build:
-        build_result = await trigger_eas_build_internal()
-
-    return {
-        "status": "pushed" if pushed else "commit_failed",
-        "files_updated": written,
-        "message": update.commit_message,
-        "git_output": (result.stdout + result.stderr)[-300:],
-        "build": build_result,
-    }
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode == 0:
+        return f"Pushed to GitHub: \"{message}\""
+    elif "nothing to commit" in output:
+        return "Nothing to commit — working tree clean."
+    else:
+        return f"Git push failed: {output[-500:]}"
 
 
-@api_router.post("/build/trigger")
-async def trigger_eas_build_endpoint():
-    """Trigger an EAS build for iOS and submit to TestFlight."""
-    return await trigger_eas_build_internal()
+def _tool_trigger_build() -> str:
+    if not GITHUB_PAT:
+        return "No GitHub PAT configured. Cannot trigger build."
+    import requests
+    r = requests.post(
+        f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/build-ios.yml/dispatches",
+        headers={"Authorization": f"Bearer {GITHUB_PAT}", "Accept": "application/vnd.github.v3+json"},
+        json={"ref": "main", "inputs": {"action": "build_and_submit"}},
+    )
+    if r.status_code == 204:
+        return "iOS build triggered! GitHub Actions will build and submit to TestFlight."
+    return f"Build trigger failed (HTTP {r.status_code}): {r.text[:300]}"
 
 
-async def trigger_eas_build_internal():
-    """Internal: trigger EAS build + TestFlight submit."""
-    try:
-        result = subprocess.run(
-            ["npx", "eas", "build", "--platform", "ios", "--profile", "production", "--non-interactive"],
-            capture_output=True, text=True, timeout=600, cwd="/app/frontend"
-        )
-        build_output = result.stdout + result.stderr
-        build_url = None
-        for line in build_output.split("\n"):
-            if "expo.dev/artifacts" in line:
-                build_url = line.strip()
+# ─── API Models ─────────────────────────────────────────────────────
 
-        submitted = False
-        if result.returncode == 0:
-            submit = subprocess.run(
-                ["npx", "eas", "submit", "--platform", "ios", "--latest", "--non-interactive"],
-                capture_output=True, text=True, timeout=600, cwd="/app/frontend"
-            )
-            submitted = submit.returncode == 0
+class ChatRequest(BaseModel):
+    messages: List[dict]  # Claude-format messages from frontend
+    tool_result: Optional[dict] = None  # Device tool result being returned
 
-        return {
-            "status": "success" if result.returncode == 0 else "build_failed",
-            "build_url": build_url,
-            "submitted_to_testflight": submitted,
-            "log": build_output[-500:],
-        }
-    except subprocess.TimeoutExpired:
-        return {"status": "timeout", "message": "Build timed out"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+class ChatResponse(BaseModel):
+    type: str  # "text", "device_tool", "error"
+    text: Optional[str] = None
+    tool_call: Optional[dict] = None  # For device tools the frontend needs to execute
+    messages: List[dict] = []  # Updated message history for frontend to store
+    server_tool_log: List[str] = []  # Log of server tools executed during this request
 
 
-# ─── Legacy Routes ─────────────────────────────────────────────────
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
-
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
-
-
-# Include the router in the main app
-app.include_router(api_router)
+# ─── FastAPI App ────────────────────────────────────────────────────
+app = FastAPI(title="Jarvis v2")
+api_router = APIRouter(prefix="/api")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+@api_router.get("/health")
+async def health():
+    return {
+        "status": "online",
+        "model": MODEL,
+        "provider": "anthropic",
+        "tools": len(TOOLS),
+        "version": "2.0.0",
+    }
+
+
+# ─── Main Chat Endpoint ────────────────────────────────────────────
+@api_router.post("/chat")
+async def chat(request: ChatRequest):
+    if not claude:
+        raise HTTPException(status_code=500, detail="Anthropic API key not configured")
+
+    try:
+        messages = request.messages.copy()
+        server_tool_log = []
+
+        # Run the tool loop
+        for loop_i in range(MAX_TOOL_LOOPS):
+            logger.info(f"Claude call #{loop_i + 1}, messages: {len(messages)}")
+
+            response = claude.messages.create(
+                model=MODEL,
+                max_tokens=4096,
+                system=SYSTEM_PROMPT,
+                tools=TOOLS,
+                messages=messages,
+            )
+
+            # Build the assistant message content blocks
+            assistant_blocks = []
+            text_parts = []
+            tool_use_block = None
+
+            for block in response.content:
+                if block.type == "text":
+                    text_parts.append(block.text)
+                    assistant_blocks.append({"type": "text", "text": block.text})
+                elif block.type == "tool_use":
+                    tool_use_block = block
+                    assistant_blocks.append({
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                    })
+
+            # Add assistant message to history
+            messages.append({"role": "assistant", "content": assistant_blocks})
+
+            # If no tool call, we're done — return text
+            if response.stop_reason != "tool_use" or tool_use_block is None:
+                final_text = "\n".join(text_parts) if text_parts else ""
+                return ChatResponse(
+                    type="text",
+                    text=final_text,
+                    messages=messages,
+                    server_tool_log=server_tool_log,
+                )
+
+            # Tool was called — check if it's device or server
+            tool_name = tool_use_block.name
+            tool_id = tool_use_block.id
+            tool_input = tool_use_block.input
+
+            if tool_name in DEVICE_TOOLS:
+                # Device tool — return to frontend for execution
+                return ChatResponse(
+                    type="device_tool",
+                    text="\n".join(text_parts) if text_parts else None,
+                    tool_call={
+                        "id": tool_id,
+                        "name": tool_name,
+                        "arguments": tool_input,
+                    },
+                    messages=messages,
+                    server_tool_log=server_tool_log,
+                )
+
+            # Server tool — execute it here and loop back to Claude
+            logger.info(f"Executing server tool: {tool_name}({json.dumps(tool_input)[:200]})")
+            result = execute_server_tool(tool_name, tool_input)
+            server_tool_log.append(f"{tool_name}: {result[:200]}")
+
+            # Add tool result to messages
+            messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": result,
+                }]
+            })
+
+        # Safety limit reached
+        return ChatResponse(
+            type="text",
+            text="I've hit my internal safety limit of tool calls. Here's what I've done so far:\n" + "\n".join(server_tool_log),
+            messages=messages,
+            server_tool_log=server_tool_log,
+        )
+
+    except anthropic.BadRequestError as e:
+        logger.error(f"Claude BadRequest: {e}")
+        return ChatResponse(type="error", text=f"Claude API error: {str(e)}", messages=request.messages)
+    except Exception as e:
+        logger.error(f"Chat error: {traceback.format_exc()}")
+        return ChatResponse(type="error", text=f"Server error: {str(e)}", messages=request.messages)
+
+
+# ─── Conversation Persistence ───────────────────────────────────────
+
+@api_router.get("/conversation")
+async def get_conversation():
+    doc = await db.conversations.find_one({"_id": "main"})
+    return {"messages": doc.get("messages", []) if doc else []}
+
+@api_router.post("/conversation")
+async def save_conversation(data: dict):
+    messages = data.get("messages", [])
+    await db.conversations.update_one(
+        {"_id": "main"},
+        {"$set": {"messages": messages}},
+        upsert=True,
+    )
+    return {"status": "saved", "count": len(messages)}
+
+@api_router.delete("/conversation")
+async def clear_conversation():
+    await db.conversations.delete_many({})
+    return {"status": "cleared"}
+
+
+# ─── Code Endpoints (also usable directly) ──────────────────────────
+
+class WriteRequest(BaseModel):
+    file_path: str
+    content: str
+    commit_message: str = "JARVIS write"
+
+@api_router.post("/code/write")
+async def write_code_file(req: WriteRequest):
+    result = _tool_write_file(req.file_path, req.content, req.commit_message)
+    return {"status": "ok", "result": result}
+
+class PatchRequest(BaseModel):
+    path: str
+    operation: str
+    find: Optional[str] = None
+    replace_with: Optional[str] = None
+    line: Optional[int] = None
+    content: Optional[str] = None
+    commit_message: str = "JARVIS patch"
+
+@api_router.post("/code/patch")
+async def patch_code_file(req: PatchRequest):
+    result = _tool_patch_file(req.model_dump())
+    return {"status": "ok", "result": result}
+
+class PushRequest(BaseModel):
+    message: str = "JARVIS commit"
+
+@api_router.post("/code/push")
+async def commit_and_push(req: PushRequest):
+    result = _tool_commit_push(req.message)
+    return {"status": "ok", "result": result}
+
+
+# ─── Deploy ─────────────────────────────────────────────────────────
+
+@api_router.post("/deploy/build")
+async def trigger_build():
+    result = _tool_trigger_build()
+    return {"status": "ok", "result": result}
+
+@api_router.get("/deploy/status")
+async def deploy_status():
+    if not GITHUB_PAT:
+        raise HTTPException(status_code=500, detail="No GitHub PAT configured")
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/build-ios.yml/runs?per_page=1",
+                headers={"Authorization": f"Bearer {GITHUB_PAT}", "Accept": "application/vnd.github.v3+json"},
+            )
+        data = r.json()
+        if data.get("workflow_runs"):
+            run = data["workflow_runs"][0]
+            return {
+                "status": run["status"],
+                "conclusion": run.get("conclusion"),
+                "run_id": run["id"],
+                "created_at": run["created_at"],
+            }
+        return {"status": "no_runs"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Mount ──────────────────────────────────────────────────────────
+app.include_router(api_router)
+
+@app.on_event("startup")
+async def startup():
+    logger.info(f"Jarvis v2 backend started — Model: {MODEL}")
+    if not ANTHROPIC_API_KEY:
+        logger.warning("⚠️ ANTHROPIC_API_KEY not set!")
+
 @app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
-# v3.2.0 - patchCodeFile + proper tool calling + stop button
+async def shutdown():
+    mongo.close()
