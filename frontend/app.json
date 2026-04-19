@@ -18,7 +18,8 @@
         "NSLocationWhenInUseUsageDescription": "Provide location-aware assistance",
         "NSPhotoLibraryUsageDescription": "Share photos and files with Jarvis",
         "NSCameraUsageDescription": "Capture photos and videos for Jarvis",
-        "NSMicrophoneUsageDescription": "Record audio and video for Jarvis"
+        "NSMicrophoneUsageDescription": "Record audio and video for Jarvis",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
