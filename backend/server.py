@@ -77,6 +77,74 @@ DEVICE_TOOLS = {
     "getDeviceInfo", "saveToPhotos", "createContact", "deleteCalendarEvent",
 }
 
+# ─── Message Sanitizer ──────────────────────────────────────────────
+MAX_HISTORY = 30  # Keep last N messages to prevent bloat/rate limits
+
+def sanitize_messages(messages: list) -> list:
+    """Clean and trim messages to prevent Claude API errors from corrupted history."""
+    if not messages:
+        return []
+
+    # Trim to last MAX_HISTORY messages
+    if len(messages) > MAX_HISTORY:
+        messages = messages[-MAX_HISTORY:]
+
+    # Ensure first message is from user (Claude requires this)
+    while messages and messages[0].get("role") != "user":
+        messages.pop(0)
+
+    if not messages:
+        return []
+
+    # Validate tool_use/tool_result pairs
+    cleaned = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+
+        # Check if assistant message has tool_use blocks
+        if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
+            tool_use_ids = [b["id"] for b in msg["content"] if isinstance(b, dict) and b.get("type") == "tool_use"]
+
+            if tool_use_ids:
+                # Check if next message has matching tool_result
+                if i + 1 < len(messages):
+                    next_msg = messages[i + 1]
+                    next_content = next_msg.get("content", [])
+                    if isinstance(next_content, list):
+                        result_ids = {b.get("tool_use_id") for b in next_content if isinstance(b, dict) and b.get("type") == "tool_result"}
+                        if tool_use_ids[0] in result_ids:
+                            cleaned.append(msg)
+                            cleaned.append(next_msg)
+                            i += 2
+                            continue
+
+                # No matching tool_result — strip tool_use, keep only text
+                text_only = [b for b in msg["content"] if isinstance(b, dict) and b.get("type") == "text"]
+                if text_only:
+                    cleaned.append({"role": "assistant", "content": text_only})
+                i += 1
+                continue
+
+        # Skip orphaned tool_result messages
+        if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            has_tool_result = any(isinstance(b, dict) and b.get("type") == "tool_result" for b in msg["content"])
+            if has_tool_result and (not cleaned or cleaned[-1].get("role") != "assistant"):
+                i += 1
+                continue
+
+        cleaned.append(msg)
+        i += 1
+
+    # Must start with user
+    while cleaned and cleaned[0].get("role") != "user":
+        cleaned.pop(0)
+
+    logger.info(f"Sanitized messages: {len(messages)} -> {len(cleaned)}")
+    return cleaned
+
+
+
 # ─── Claude Tool Definitions ────────────────────────────────────────
 TOOLS = [
     # ── Device Tools ────────────────────────────────────────────
@@ -382,7 +450,8 @@ async def chat(request: ChatRequest):
     if not claude:
         raise HTTPException(status_code=500, detail="Anthropic API key not configured")
     try:
-        messages = request.messages.copy()
+        # Sanitize and trim messages to prevent corruption and bloat
+        messages = sanitize_messages(request.messages.copy())
         server_tool_log = []
 
         for loop_i in range(MAX_TOOL_LOOPS):
