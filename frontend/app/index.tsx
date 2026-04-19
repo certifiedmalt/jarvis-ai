@@ -148,9 +148,11 @@ export default function JarvisChat() {
         audioPlayer.replace({ uri: fileUri });
         audioPlayer.play();
 
-        // Poll for playback completion
+        // Poll for playback completion — wait briefly before checking
+        let started = false;
         const checkInterval = setInterval(() => {
-          if (!audioPlayer.playing) {
+          if (audioPlayer.playing) started = true;
+          if (started && !audioPlayer.playing) {
             clearInterval(checkInterval);
             setIsSpeaking(false);
             setSpeakingMsgId(null);
