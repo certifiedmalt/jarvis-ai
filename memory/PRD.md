@@ -1,55 +1,47 @@
-# Jarvis AI - Product Requirements Document
+# Jarvis v2 — Product Requirements Document
 
-## Overview
-Jarvis is a standalone AI assistant mobile app (Expo/React Native) inspired by Iron Man's JARVIS. It uses Together.ai (Llama 3.3 70B) for unrestricted AI chat, has direct Binance trading integration, file upload/analysis, and can interact with the user's iPhone (contacts, calendar, location, clipboard).
+## Vision
+A personal AI assistant app for iOS that can autonomously manage digital tasks, modify its own codebase, and push self-updates via GitHub + TestFlight (and OTA via expo-updates).
 
-## Architecture
-- **Frontend**: Expo React Native (iOS + Android + Web)
-- **Backend**: FastAPI (Python) — Deployed on Railway (auto-deploys from GitHub)
-- **Database**: MongoDB
-- **AI**: Together.ai Llama 3.3 70B (user's own key, no Emergent dependency)
-- **Trading**: Binance API (python-binance)
+## Core Architecture
+- **Frontend**: Expo React Native (file-based routing via expo-router)
+- **Backend**: FastAPI on Python
+- **Database**: MongoDB (conversation persistence)
+- **LLM**: Anthropic Claude (claude-sonnet-4-6)
+- **Self-update**: GitHub Actions + EAS Build + TestFlight / expo-updates OTA
 
-## Core Features
+## Key Design Decision
+The backend handles server-side tool loops internally (code, deploy, git tools) and only returns to the frontend when:
+1. Claude has a final text response
+2. Claude needs a device-side tool (contacts, calendar, location, TTS)
 
-### Implemented
-1. **Unrestricted AI Chat** — JARVIS persona (nonchalant, British wit, no safety disclaimers), powered by Llama 3.3 70B via Together.ai
-2. **File Upload & Analysis** — Upload documents (PDF, txt, CSV, JSON, code files) via `+` button, JARVIS reads and analyzes them
-3. **iOS Native Integrations** — JARVIS can access:
-   - Contacts (search, list)
-   - Calendar (upcoming events)
-   - Location (GPS + reverse geocode)
-   - Clipboard (copy text)
-   - Sharing (share content)
-4. **Binance Trading Backend** — Portfolio view, price checks, market/limit orders, trade history
-5. **AI-Powered Trading** — JARVIS understands natural language trading commands and generates action blocks
-6. **Conversation Storage** — All chats saved to MongoDB
-7. **Health Monitoring** — Health endpoint with LLM + Binance status
-8. **Better Error Handling** — Descriptive error messages (rate limit, auth, timeout) instead of generic failures
+This eliminates frontend parsing complexity and reduces round-trips.
 
-### Upcoming
-1. Book Writing assistant mode
-2. Business Planning assistant mode
-3. Re-introduce UI polish (icons, animations) carefully
+## Phase 1 (MVP) — COMPLETED
+- [x] Clean FastAPI backend with Claude integration
+- [x] Conversational chat UI (dark theme, mobile-first)
+- [x] Persistent memory via MongoDB
+- [x] Tool execution framework (server + device tools)
+- [x] Server tools: listRepoPaths, readCodeFile, writeCodeFile, patchCodeFile, commitAndPush, triggerIOSBuild
+- [x] Device tools: getLocation, getContacts, getCalendar, speakText
+- [x] Stop and Clear Memory buttons
+- [x] Backend-tested all endpoints
 
-### Future
-1. Automated trading strategies
-2. Secure on-device API key storage (SecureStore)
-3. Siri Shortcuts integration
+## Phase 2 — Self-Updating
+- [ ] GitHub integration (push code from within app)
+- [ ] EAS Build + TestFlight pipeline
+- [ ] expo-updates for OTA JS changes
+- [ ] Jarvis modifies its own code and triggers rebuilds
 
-## API Endpoints
-- `GET /api/health` — System health check
-- `POST /api/chat` — Chat with JARVIS (Llama 3.3 + trading + device actions)
-- `POST /api/chat/stream` — Streaming chat response
-- `POST /api/upload` — Upload and extract text from files
-- `POST /api/chat/with-file` — Chat with file context
-- `GET /api/binance/portfolio` — Portfolio balances
-- `GET /api/binance/prices` — Major crypto prices
-- `GET /api/binance/price/{symbol}` — Specific pair price
-- `POST /api/binance/trade` — Place a trade
-- `GET /api/binance/trades` — Recent trade history
+## Phase 3 — Device & Ecosystem
+- [ ] iOS native integrations (Contacts, Calendar, Reminders, Location)
+- [ ] TTS with ElevenLabs (custom Jarvis voice)
+- [ ] Chat modes (Book Writing, Business Planning)
 
-## Known Limitations
-- Binance API blocked from Railway server (US geo-restriction) — needs user clarification on Binance.US vs Global
-- iOS native features (contacts, calendar, location) require a new EAS build to test on device
-- UI is intentionally minimal (stripped to fix iOS build crash) — needs gradual re-polish
+## Phase 4 — Polish & Security
+- [ ] SecureStore for API keys
+- [ ] UI polish
+- [ ] Standing orders / trust boundaries
+
+## Credentials
+All saved in `/app/memory/test_credentials.md`
