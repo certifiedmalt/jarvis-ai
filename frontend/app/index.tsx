@@ -686,6 +686,32 @@ export default function JarvisChat() {
           </Text>
         </View>
         <TouchableOpacity
+          style={styles.clearMemBtn}
+          onPress={() => {
+            Alert.alert(
+              'Clear Memory',
+              'This will erase all of Jarvis\'s conversation history. He will start fresh. Are you sure?',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                {
+                  text: 'Clear',
+                  style: 'destructive',
+                  onPress: async () => {
+                    try {
+                      await fetch(`${BACKEND_URL}/api/conversation`, { method: 'DELETE' });
+                      setMessages([]);
+                    } catch (err) {
+                      console.log('Clear memory error:', err);
+                    }
+                  },
+                },
+              ]
+            );
+          }}
+        >
+          <Text style={styles.clearMemText}>🗑</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
           style={[styles.voiceToggle, autoRead && styles.voiceToggleOn]}
           onPress={() => {
             if (isSpeaking) stopSpeaking();
@@ -900,6 +926,12 @@ const styles = StyleSheet.create({
     borderRadius: 22, backgroundColor: '#FF4444', alignItems: 'center', justifyContent: 'center',
   },
   stopIcon: { fontSize: 16, fontWeight: '700', color: '#FFF' },
+  clearMemBtn: {
+    width: 36, height: 36,
+    borderRadius: 18, backgroundColor: '#1A1A25', alignItems: 'center', justifyContent: 'center',
+    marginRight: 8,
+  },
+  clearMemText: { fontSize: 16 },
   loopWarning: {
     backgroundColor: '#FF444420', borderWidth: 1, borderColor: '#FF444460',
     borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, marginBottom: 8,
