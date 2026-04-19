@@ -50,8 +50,8 @@ class JarvisBackendTester:
                 self.log(f"Expected status 'online', got '{data.get('status')}'", "ERROR")
                 return False
                 
-            if data.get("model") != "claude-sonnet-4-20250514":
-                self.log(f"Expected model 'claude-sonnet-4-20250514', got '{data.get('model')}'", "ERROR")
+            if data.get("model") != "claude-sonnet-4-6":
+                self.log(f"Expected model 'claude-sonnet-4-6', got '{data.get('model')}'", "ERROR")
                 return False
                 
             if data.get("provider") != "anthropic":

@@ -30,7 +30,7 @@ GITHUB_PAT = os.getenv("GITHUB_PAT")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "certifiedmalt/jarvis-ai")
 REPO_DIR = os.getenv("REPO_DIR", "/app")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-sonnet-4-6"
 MAX_TOOL_LOOPS = 15  # Safety brake for backend tool loop
 
 logger = logging.getLogger("jarvis")
