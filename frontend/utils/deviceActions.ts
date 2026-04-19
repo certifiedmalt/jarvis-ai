@@ -251,14 +251,10 @@ async function handleSaveToPhotos(url: string): Promise<string> {
     const filename = url.split('/').pop()?.split('?')[0] || 'jarvis_image.jpg';
     const localUri = FileSystem.cacheDirectory + filename;
 
-    // Use modern Expo FileSystem API (compatible with SDK 54+)
-    const fileInfo = await FileSystem.getInfoAsync(localUri);
-    if (!fileInfo.exists) {
-      const result = await FileSystem.createDownloadResumable(url, localUri).downloadAsync();
-      if (!result || result.status !== 200) return `Download failed: HTTP ${result?.status}`;
-    }
+    const result = await FileSystem.downloadAsync(url, localUri);
+    if (!result || result.status !== 200) return `Download failed: HTTP ${result?.status}`;
 
-    const asset = await MediaLibrary.createAssetAsync(localUri);
+    const asset = await MediaLibrary.createAssetAsync(result.uri);
     return `Saved to Photos: ${asset.filename}`;
   } catch (err: any) {
     return `Save failed: ${err.message || String(err)}`;
