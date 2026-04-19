@@ -64,7 +64,11 @@ TOOL CATEGORIES:
 - Utility: generateQRCode, calculateExpression, encodeBase64, decodeBase64, jsonPrettify
 - Device (iOS): getLocation, getContacts, getCalendar, speakText, createCalendarEvent, setReminder, openURL, readClipboard, getDeviceInfo, saveToPhotos, createContact, deleteCalendarEvent
 
-IMPORTANT: Device tools run on the user's iPhone. All other tools run on the server."""
+IMPORTANT: Device tools run on the user's iPhone. All other tools run on the server.
+
+SPECIAL BEHAVIORS:
+- When generating images with generateImage, ALWAYS follow up by calling saveToPhotos with the returned URL so the image goes directly to the user's camera roll. Don't just give them a URL.
+- When you have URLs to share, present them clearly so the user can tap them."""
 
 # ─── Device tools (executed by frontend) ────────────────────────────
 DEVICE_TOOLS = {

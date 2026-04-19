@@ -18,6 +18,7 @@
         "NSCalendarsUsageDescription": "View and manage your schedule through Jarvis",
         "NSLocationWhenInUseUsageDescription": "Provide location-aware assistance",
         "NSPhotoLibraryUsageDescription": "Share photos and files with Jarvis",
+        "NSPhotoLibraryAddUsageDescription": "Save generated images to your photos",
         "NSCameraUsageDescription": "Capture photos and videos for Jarvis",
         "NSMicrophoneUsageDescription": "Record audio and video for Jarvis"
       }
@@ -70,7 +71,14 @@
           "locationWhenInUsePermission": "Jarvis uses your location for context-aware help."
         }
       ],
-      "expo-audio"
+      "expo-audio",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Save generated images to your photo library.",
+          "savePhotosPermission": "Save generated images to your photo library."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true

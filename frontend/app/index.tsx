@@ -13,6 +13,7 @@ import {
   Alert,
   ActionSheetIOS,
   Image,
+  Linking,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Constants from 'expo-constants';
@@ -48,6 +49,39 @@ type AttachedFile = {
 
 // ─── Device Tool Imports ────────────────────────────────────────────
 import { executeDeviceTool } from '../utils/deviceActions';
+
+// ─── Linkified Text Component ───────────────────────────────────────
+const URL_REGEX = /(https?:\/\/[^\s\)]+)/g;
+
+function LinkifiedText({ text, style }: { text: string; style: any }) {
+  if (!text) return null;
+  const parts = text.split(URL_REGEX);
+  return (
+    <Text style={style}>
+      {parts.map((part, i) => {
+        if (URL_REGEX.test(part)) {
+          URL_REGEX.lastIndex = 0; // Reset regex state
+          return (
+            <Text
+              key={i}
+              style={{ color: '#00D9FF', textDecorationLine: 'underline' }}
+              onPress={() => Linking.openURL(part)}
+              onLongPress={() => {
+                import('expo-clipboard').then(Clipboard => {
+                  Clipboard.setStringAsync(part);
+                  Alert.alert('Copied', 'URL copied to clipboard');
+                });
+              }}
+            >
+              {part}
+            </Text>
+          );
+        }
+        return <Text key={i}>{part}</Text>;
+      })}
+    </Text>
+  );
+}
 
 export default function JarvisChat() {
   const insets = useSafeAreaInsets();
@@ -482,13 +516,14 @@ export default function JarvisChat() {
                   <Text style={{ fontSize: 12, color: '#FFF', opacity: 0.7 }}>📎 {msg.fileName}</Text>
                 </View>
               )}
-              <Text style={[
-                styles.msgText,
-                msg.role === 'user' && styles.userText,
-                msg.role === 'system' && styles.systemText,
-              ]}>
-                {msg.content || (isGenerating ? 'Thinking...' : '')}
-              </Text>
+              <LinkifiedText
+                text={msg.content || (isGenerating ? 'Thinking...' : '')}
+                style={[
+                  styles.msgText,
+                  msg.role === 'user' && styles.userText,
+                  msg.role === 'system' && styles.systemText,
+                ]}
+              />
               {isGenerating && !msg.content && msg.role === 'assistant' && (
                 <ActivityIndicator size="small" color="#00D9FF" style={{ marginTop: 4 }} />
               )}
