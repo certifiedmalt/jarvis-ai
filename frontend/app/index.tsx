@@ -176,13 +176,14 @@ export default function JarvisChat() {
     }
   }, []);
 
-  // ─── Execute Device Tool ──────────────────────────────────────────
+  // ─── Execute Device Tool (with error recovery) ─────────────────────
   const handleDeviceTool = useCallback(async (
     toolCall: ToolCall,
     currentClaudeMessages: any[],
     reasoning: string | null,
+    depth: number = 0,
   ) => {
-    if (abortRef.current) {
+    if (abortRef.current || depth > 8) {
       setIsGenerating(false);
       return;
     }
@@ -190,33 +191,33 @@ export default function JarvisChat() {
     const { name, arguments: args, id: toolId } = toolCall;
 
     // Show what's happening
-    if (reasoning) {
-      setMessages(prev => {
-        const updated = [...prev];
-        const last = updated.length - 1;
-        if (updated[last]?.role === 'assistant' && !updated[last].content) {
-          updated[last] = { ...updated[last], content: reasoning };
-        }
-        return updated;
-      });
-    }
+    setMessages(prev => {
+      const updated = [...prev];
+      const last = updated.length - 1;
+      if (updated[last]?.role === 'assistant' && !updated[last].content) {
+        updated[last] = { ...updated[last], content: reasoning || `Running ${name}...` };
+      }
+      return updated;
+    });
 
-    // Map tool name to device action
+    // Execute the device tool — ALWAYS produce a result, never throw
     let result: string;
     try {
       result = await executeDeviceTool(name, args);
     } catch (err: any) {
-      result = `Device error: ${err.message || String(err)}`;
+      result = `FAILED: ${name} error — ${err.message || String(err)}`;
+      console.log(`Device tool ${name} failed:`, err);
     }
 
-    // Show tool result
+    // Show tool result to user
     setMessages(prev => [...prev, {
       id: `tool_${Date.now()}`,
       role: 'system' as const,
       content: `[${name}] ${result}`,
     }]);
 
-    // Send tool result back to backend
+    // ALWAYS send the result back to Claude (even if it's an error)
+    // This prevents the orphaned tool_use problem
     const messagesWithResult = [
       ...currentClaudeMessages,
       {
@@ -232,47 +233,62 @@ export default function JarvisChat() {
     // Add thinking placeholder
     setMessages(prev => [...prev, { id: `a_${Date.now()}`, role: 'assistant', content: '' }]);
 
-    try {
-      const res = await fetchWithTimeout(`${BACKEND_URL}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: messagesWithResult }),
-      });
-      const data = await res.json();
+    // Send result to Claude with auto-retry
+    let retries = 0;
+    const maxRetries = 1;
 
-      if (data.type === 'device_tool') {
-        // Another device tool needed — recurse
-        handleDeviceTool(data.tool_call, data.messages, data.text);
-      } else {
-        // Final text response
-        const responseText = data.text || '';
-        setMessages(prev => {
-          const updated = [...prev];
-          const last = updated.length - 1;
-          if (updated[last]?.role === 'assistant' && !updated[last].content) {
-            updated[last] = { ...updated[last], content: responseText };
-          }
-          return updated;
+    while (retries <= maxRetries) {
+      try {
+        const res = await fetchWithTimeout(`${BACKEND_URL}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: messagesWithResult }),
         });
-        setClaudeMessages(data.messages || []);
-        await saveConversation(data.messages || []);
-        if (data.server_tool_log?.length > 0) {
-          setToolLog(prev => [...prev, ...data.server_tool_log]);
+        const data = await res.json();
+
+        if (data.type === 'device_tool') {
+          // Another device tool — recurse with depth tracking
+          handleDeviceTool(data.tool_call, data.messages, data.text, depth + 1);
+          return;
+        } else {
+          // Final text response or error
+          const responseText = data.text || (data.type === 'error' ? `Error: ${data.text}` : '');
+          setMessages(prev => {
+            const updated = [...prev];
+            const last = updated.length - 1;
+            if (updated[last]?.role === 'assistant' && !updated[last].content) {
+              updated[last] = { ...updated[last], content: responseText };
+            }
+            return updated;
+          });
+          setClaudeMessages(data.messages || []);
+          await saveConversation(data.messages || []);
+          if (data.server_tool_log?.length > 0) {
+            setToolLog(prev => [...prev, ...data.server_tool_log]);
+          }
+          setIsGenerating(false);
+          return;
         }
-        setIsGenerating(false);
+      } catch (err: any) {
+        retries++;
+        if (retries > maxRetries) {
+          // All retries failed — show error but don't go silent
+          setMessages(prev => {
+            const updated = [...prev];
+            const last = updated.length - 1;
+            if (updated[last]?.role === 'assistant') {
+              updated[last] = { ...updated[last], content: `Connection lost after ${name}. Error: ${err.message}. The tool did run — try asking "what happened?" to continue.` };
+            }
+            return updated;
+          });
+          setIsGenerating(false);
+          return;
+        }
+        // Wait 2s before retry
+        await new Promise(r => setTimeout(r, 2000));
       }
-    } catch (err: any) {
-      setMessages(prev => {
-        const updated = [...prev];
-        const last = updated.length - 1;
-        if (updated[last]?.role === 'assistant') {
-          updated[last] = { ...updated[last], content: `Connection error: ${err.message}` };
-        }
-        return updated;
-      });
-      setIsGenerating(false);
     }
-  }, [saveConversation]);
+  }, [saveConversation, fetchWithTimeout]);
 
   // ─── File Attachment ────────────────────────────────────────────────
   const pickFromPhotos = useCallback(async () => {
@@ -379,27 +395,54 @@ export default function JarvisChat() {
     try {
       const newClaudeMessages = [...claudeMessages, { role: "user", content: userText }];
       let data;
+      let retries = 0;
+      const maxRetries = 1;
 
-      if (currentFile) {
-        // File upload via multipart form
-        const formData = new FormData();
-        formData.append('messages', JSON.stringify(newClaudeMessages));
-        formData.append('file', { uri: currentFile.uri, name: currentFile.name, type: currentFile.mimeType } as any);
-
-        const res = await fetchWithTimeout(`${BACKEND_URL}/api/chat/with-file`, { method: 'POST', body: formData });
-        data = await res.json();
-        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
-      } else {
-        const res = await fetchWithTimeout(`${BACKEND_URL}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: newClaudeMessages }),
-        });
-        if (!res.ok) {
-          const errData = await res.json().catch(() => ({ detail: 'Unknown error' }));
-          throw new Error(errData.detail || `HTTP ${res.status}`);
+      while (retries <= maxRetries) {
+        try {
+          if (currentFile) {
+            const formData = new FormData();
+            formData.append('messages', JSON.stringify(newClaudeMessages));
+            formData.append('file', { uri: currentFile.uri, name: currentFile.name, type: currentFile.mimeType } as any);
+            const res = await fetchWithTimeout(`${BACKEND_URL}/api/chat/with-file`, { method: 'POST', body: formData });
+            data = await res.json();
+            if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+          } else {
+            const res = await fetchWithTimeout(`${BACKEND_URL}/api/chat`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ messages: newClaudeMessages }),
+            });
+            if (!res.ok) {
+              const errData = await res.json().catch(() => ({ detail: 'Unknown error' }));
+              throw new Error(errData.detail || `HTTP ${res.status}`);
+            }
+            data = await res.json();
+          }
+          break; // Success — exit retry loop
+        } catch (err: any) {
+          retries++;
+          if (retries > maxRetries) throw err;
+          // Show retry status
+          setMessages(prev => {
+            const updated = [...prev];
+            const last = updated.length - 1;
+            if (updated[last]?.role === 'assistant') {
+              updated[last] = { ...updated[last], content: 'Connection hiccup — retrying...' };
+            }
+            return updated;
+          });
+          await new Promise(r => setTimeout(r, 2000));
+          // Reset placeholder for retry
+          setMessages(prev => {
+            const updated = [...prev];
+            const last = updated.length - 1;
+            if (updated[last]?.role === 'assistant') {
+              updated[last] = { ...updated[last], content: '' };
+            }
+            return updated;
+          });
         }
-        data = await res.json();
       }
 
       if (data.type === 'device_tool') {
