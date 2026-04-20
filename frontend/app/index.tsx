@@ -431,7 +431,29 @@ export default function JarvisChat() {
 
       while (retries <= maxRetries) {
         try {
-          if (currentFile) {
+          if (currentFile && currentFile.mimeType.startsWith('image/')) {
+            // Convert image to base64 and send as JSON (more reliable than FormData on iOS)
+            const base64 = await FileSystem.readAsStringAsync(currentFile.uri, { encoding: FileSystem.EncodingType.Base64 });
+            const imageMessage = {
+              role: "user",
+              content: [
+                { type: "image", source: { type: "base64", media_type: currentFile.mimeType, data: base64 } },
+                { type: "text", text: userText }
+              ]
+            };
+            const messagesWithImage = [...claudeMessages, imageMessage];
+            const res = await fetchWithTimeout(`${BACKEND_URL}/api/chat`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ messages: messagesWithImage }),
+            });
+            if (!res.ok) {
+              const errData = await res.json().catch(() => ({ detail: 'Unknown error' }));
+              throw new Error(errData.detail || `HTTP ${res.status}`);
+            }
+            data = await res.json();
+          } else if (currentFile) {
+            // Non-image files via FormData
             const formData = new FormData();
             formData.append('messages', JSON.stringify(newClaudeMessages));
             formData.append('file', { uri: currentFile.uri, name: currentFile.name, type: currentFile.mimeType } as any);

@@ -68,7 +68,8 @@ IMPORTANT: Device tools run on the user's iPhone. All other tools run on the ser
 
 SPECIAL BEHAVIORS:
 - When generating images with generateImage, ALWAYS follow up by calling saveToPhotos with the returned URL so the image goes directly to the user's camera roll. Don't just give them a URL.
-- When you have URLs to share, present them clearly so the user can tap them."""
+- When you have URLs to share, present them clearly so the user can tap them.
+- YOU CAN SEE IMAGES. When the user attaches a photo, you receive it directly via Claude Vision. Analyze it, describe it, answer questions about it. Never tell the user you can't see their photo."""
 
 # ─── Device tools (executed by frontend) ────────────────────────────
 DEVICE_TOOLS = {
