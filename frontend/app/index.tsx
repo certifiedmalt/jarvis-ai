@@ -14,6 +14,7 @@ import {
   ActionSheetIOS,
   Image,
   Linking,
+  AppState,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Constants from 'expo-constants';
@@ -103,19 +104,49 @@ export default function JarvisChat() {
   const [attachedFile, setAttachedFile] = useState<AttachedFile | null>(null);
   const abortRef = useRef(false);
   const scrollViewRef = useRef<ScrollView>(null);
+  const pendingRequestRef = useRef<{messages: any[], text: string} | null>(null);
 
-  // ─── Health Check ─────────────────────────────────────────────────
-  useEffect(() => {
-    fetch(`${BACKEND_URL}/api/health`)
-      .then(res => res.json())
-      .then(data => {
+  // ─── Health Check with retry (handles Railway cold start) ─────────
+  const checkHealth = useCallback(async (retries = 3) => {
+    for (let i = 0; i < retries; i++) {
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/health`, { signal: AbortSignal.timeout(15000) });
+        const data = await res.json();
         if (data.status === 'online') {
           setIsOnline(true);
           setModelName(data.model || 'Claude');
+          return true;
         }
-      })
-      .catch(() => setIsOnline(false));
+      } catch {
+        if (i < retries - 1) await new Promise(r => setTimeout(r, 3000));
+      }
+    }
+    setIsOnline(false);
+    setModelName('Offline');
+    return false;
   }, []);
+
+  useEffect(() => { checkHealth(); }, [checkHealth]);
+
+  // ─── Keep Railway alive + handle app foreground/background ────────
+  useEffect(() => {
+    // Ping Railway every 4 minutes to prevent sleep
+    const keepAlive = setInterval(() => {
+      fetch(`${BACKEND_URL}/api/health`).catch(() => {});
+    }, 4 * 60 * 1000);
+
+    // When app comes back to foreground, re-check health
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        checkHealth(2);
+      }
+    });
+
+    return () => {
+      clearInterval(keepAlive);
+      sub.remove();
+    };
+  }, [checkHealth]);
 
   // ─── Auto-scroll ──────────────────────────────────────────────────
   useEffect(() => {

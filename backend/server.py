@@ -611,6 +611,21 @@ async def startup():
     logger.info(f"Jarvis v2 backend started — Model: {MODEL}, Tools: {len(TOOLS)}")
     if not ANTHROPIC_API_KEY:
         logger.warning("ANTHROPIC_API_KEY not set!")
+    # Start self-ping to prevent Railway sleep
+    import asyncio
+    asyncio.create_task(self_ping())
+
+async def self_ping():
+    """Ping ourselves every 4 minutes to prevent Railway from sleeping."""
+    import asyncio
+    while True:
+        await asyncio.sleep(240)  # 4 minutes
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.get("http://localhost:8001/api/health", timeout=5)
+            logger.info("Self-ping: alive")
+        except Exception:
+            pass
 
 @app.on_event("shutdown")
 async def shutdown():
