@@ -207,6 +207,23 @@ export default function JarvisChat() {
     }
   }, []);
 
+  // ─── Fetch with timeout (120s for tool chains like DALL-E) ────────
+  const fetchWithTimeout = useCallback(async (url: string, options: RequestInit, timeoutMs = 120000) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timer);
+      return res;
+    } catch (err: any) {
+      clearTimeout(timer);
+      if (err.name === 'AbortError') {
+        throw new Error('Request timed out — Jarvis may still be working. Try again in a moment.');
+      }
+      throw err;
+    }
+  }, []);
+
   // ─── Execute Device Tool (with error recovery) ─────────────────────
   const handleDeviceTool = useCallback(async (
     toolCall: ToolCall,
@@ -388,23 +405,6 @@ export default function JarvisChat() {
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
   };
-
-  // ─── Fetch with timeout (120s for tool chains like DALL-E) ────────
-  const fetchWithTimeout = useCallback(async (url: string, options: RequestInit, timeoutMs = 120000) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const res = await fetch(url, { ...options, signal: controller.signal });
-      clearTimeout(timer);
-      return res;
-    } catch (err: any) {
-      clearTimeout(timer);
-      if (err.name === 'AbortError') {
-        throw new Error('Request timed out — Jarvis may still be working. Try again in a moment.');
-      }
-      throw err;
-    }
-  }, []);
 
   // ─── Send Message ─────────────────────────────────────────────────
   const sendMessage = useCallback(async () => {
