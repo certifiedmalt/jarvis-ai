@@ -225,7 +225,7 @@ export default function JarvisChat() {
     setMessages(prev => [...prev, { id: `a_${Date.now()}`, role: 'assistant', content: '' }]);
 
     try {
-      const res = await fetch(`${BACKEND_URL}/api/chat`, {
+      const res = await fetchWithTimeout(`${BACKEND_URL}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ messages: messagesWithResult }),
@@ -334,6 +334,23 @@ export default function JarvisChat() {
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
   };
 
+  // ─── Fetch with timeout (120s for tool chains like DALL-E) ────────
+  const fetchWithTimeout = useCallback(async (url: string, options: RequestInit, timeoutMs = 120000) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timer);
+      return res;
+    } catch (err: any) {
+      clearTimeout(timer);
+      if (err.name === 'AbortError') {
+        throw new Error('Request timed out — Jarvis may still be working. Try again in a moment.');
+      }
+      throw err;
+    }
+  }, []);
+
   // ─── Send Message ─────────────────────────────────────────────────
   const sendMessage = useCallback(async () => {
     if ((!inputText.trim() && !attachedFile) || isGenerating) return;
@@ -361,11 +378,11 @@ export default function JarvisChat() {
         formData.append('messages', JSON.stringify(newClaudeMessages));
         formData.append('file', { uri: currentFile.uri, name: currentFile.name, type: currentFile.mimeType } as any);
 
-        const res = await fetch(`${BACKEND_URL}/api/chat/with-file`, { method: 'POST', body: formData });
+        const res = await fetchWithTimeout(`${BACKEND_URL}/api/chat/with-file`, { method: 'POST', body: formData });
         data = await res.json();
         if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
       } else {
-        const res = await fetch(`${BACKEND_URL}/api/chat`, {
+        const res = await fetchWithTimeout(`${BACKEND_URL}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ messages: newClaudeMessages }),
