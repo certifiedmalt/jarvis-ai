@@ -51,36 +51,44 @@ type AttachedFile = {
 import { executeDeviceTool } from '../utils/deviceActions';
 
 // ─── Linkified Text Component ───────────────────────────────────────
-const URL_REGEX = /(https?:\/\/[^\s\)]+)/g;
-
 function LinkifiedText({ text, style }: { text: string; style: any }) {
-  if (!text) return null;
-  const parts = text.split(URL_REGEX);
-  return (
-    <Text style={style}>
-      {parts.map((part, i) => {
-        if (URL_REGEX.test(part)) {
-          URL_REGEX.lastIndex = 0; // Reset regex state
-          return (
-            <Text
-              key={i}
-              style={{ color: '#00D9FF', textDecorationLine: 'underline' }}
-              onPress={() => Linking.openURL(part)}
-              onLongPress={() => {
-                import('expo-clipboard').then(Clipboard => {
-                  Clipboard.setStringAsync(part);
-                  Alert.alert('Copied', 'URL copied to clipboard');
-                });
-              }}
-            >
-              {part}
-            </Text>
-          );
-        }
-        return <Text key={i}>{part}</Text>;
-      })}
-    </Text>
-  );
+  if (!text) return <Text style={style}>{''}</Text>;
+  
+  const urlPattern = /https?:\/\/[^\s\)]+/g;
+  const matches: { index: number; url: string }[] = [];
+  let match;
+  while ((match = urlPattern.exec(text)) !== null) {
+    matches.push({ index: match.index, url: match[0] });
+  }
+  
+  if (matches.length === 0) {
+    return <Text style={style}>{text}</Text>;
+  }
+  
+  const parts: React.ReactNode[] = [];
+  let lastIndex = 0;
+  
+  matches.forEach((m, i) => {
+    if (m.index > lastIndex) {
+      parts.push(<Text key={`t${i}`}>{text.slice(lastIndex, m.index)}</Text>);
+    }
+    parts.push(
+      <Text
+        key={`u${i}`}
+        style={{ color: '#00D9FF', textDecorationLine: 'underline' as const }}
+        onPress={() => Linking.openURL(m.url)}
+      >
+        {m.url}
+      </Text>
+    );
+    lastIndex = m.index + m.url.length;
+  });
+  
+  if (lastIndex < text.length) {
+    parts.push(<Text key="end">{text.slice(lastIndex)}</Text>);
+  }
+  
+  return <Text style={style}>{parts}</Text>;
 }
 
 export default function JarvisChat() {
