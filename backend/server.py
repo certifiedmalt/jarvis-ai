@@ -79,10 +79,10 @@ DEVICE_TOOLS = {
 }
 
 # ─── Message Sanitizer ──────────────────────────────────────────────
-MAX_HISTORY = 30  # Keep last N messages to prevent bloat/rate limits
+MAX_HISTORY = 20  # Keep last N messages to prevent bloat
 
 def sanitize_messages(messages: list) -> list:
-    """Clean and trim messages to prevent Claude API errors from corrupted history."""
+    """Aggressively clean messages to prevent Claude API errors."""
     if not messages:
         return []
 
@@ -90,59 +90,95 @@ def sanitize_messages(messages: list) -> list:
     if len(messages) > MAX_HISTORY:
         messages = messages[-MAX_HISTORY:]
 
-    # Ensure first message is from user (Claude requires this)
+    # Ensure first message is from user
     while messages and messages[0].get("role") != "user":
         messages.pop(0)
 
     if not messages:
         return []
 
-    # Validate tool_use/tool_result pairs
+    # AGGRESSIVE: Collect all tool_use IDs and all tool_result IDs
+    # Then strip any that don't have a match
+    tool_use_ids_in_msg = {}  # tool_id -> message index
+    tool_result_ids = set()
+
+    for i, msg in enumerate(messages):
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "tool_use":
+                        tool_use_ids_in_msg[block.get("id")] = i
+                    elif block.get("type") == "tool_result":
+                        tool_result_ids.add(block.get("tool_use_id"))
+
+    # Find orphaned tool_use IDs (no matching tool_result)
+    orphaned_tool_ids = set(tool_use_ids_in_msg.keys()) - tool_result_ids
+    # Find orphaned tool_result IDs (no matching tool_use)
+    all_tool_use_ids = set(tool_use_ids_in_msg.keys())
+    orphaned_result_ids = tool_result_ids - all_tool_use_ids
+
+    if orphaned_tool_ids or orphaned_result_ids:
+        logger.warning(f"Found {len(orphaned_tool_ids)} orphaned tool_use, {len(orphaned_result_ids)} orphaned tool_result")
+
+    # Rebuild messages, stripping orphaned blocks
     cleaned = []
-    i = 0
-    while i < len(messages):
-        msg = messages[i]
+    for msg in messages:
+        content = msg.get("content", [])
 
-        # Check if assistant message has tool_use blocks
-        if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
-            tool_use_ids = [b["id"] for b in msg["content"] if isinstance(b, dict) and b.get("type") == "tool_use"]
-
-            if tool_use_ids:
-                # Check if next message has matching tool_result
-                if i + 1 < len(messages):
-                    next_msg = messages[i + 1]
-                    next_content = next_msg.get("content", [])
-                    if isinstance(next_content, list):
-                        result_ids = {b.get("tool_use_id") for b in next_content if isinstance(b, dict) and b.get("type") == "tool_result"}
-                        if tool_use_ids[0] in result_ids:
-                            cleaned.append(msg)
-                            cleaned.append(next_msg)
-                            i += 2
-                            continue
-
-                # No matching tool_result — strip tool_use, keep only text
-                text_only = [b for b in msg["content"] if isinstance(b, dict) and b.get("type") == "text"]
-                if text_only:
-                    cleaned.append({"role": "assistant", "content": text_only})
-                i += 1
+        if isinstance(content, list):
+            # Filter out orphaned tool_use blocks
+            if msg.get("role") == "assistant":
+                new_blocks = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id") in orphaned_tool_ids:
+                        continue  # Skip orphaned tool_use
+                    new_blocks.append(block)
+                if new_blocks:
+                    cleaned.append({"role": "assistant", "content": new_blocks})
                 continue
 
-        # Skip orphaned tool_result messages
-        if msg.get("role") == "user" and isinstance(msg.get("content"), list):
-            has_tool_result = any(isinstance(b, dict) and b.get("type") == "tool_result" for b in msg["content"])
-            if has_tool_result and (not cleaned or cleaned[-1].get("role") != "assistant"):
-                i += 1
+            # Filter out orphaned tool_result blocks
+            if msg.get("role") == "user":
+                has_only_orphaned = True
+                new_blocks = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        if block.get("tool_use_id") in orphaned_result_ids or block.get("tool_use_id") in orphaned_tool_ids:
+                            continue  # Skip orphaned tool_result
+                        has_only_orphaned = False
+                    else:
+                        has_only_orphaned = False
+                    new_blocks.append(block)
+                if new_blocks and not has_only_orphaned:
+                    cleaned.append({"role": "user", "content": new_blocks})
+                elif new_blocks:
+                    # Check if anything left after filtering
+                    remaining = [b for b in new_blocks if not (isinstance(b, dict) and b.get("type") == "tool_result")]
+                    if remaining:
+                        cleaned.append({"role": "user", "content": remaining})
                 continue
 
         cleaned.append(msg)
-        i += 1
 
-    # Must start with user
+    # Ensure starts with user and no consecutive same-role messages
     while cleaned and cleaned[0].get("role") != "user":
         cleaned.pop(0)
 
-    logger.info(f"Sanitized messages: {len(messages)} -> {len(cleaned)}")
-    return cleaned
+    # Remove consecutive same-role messages (keep last)
+    final = []
+    for msg in cleaned:
+        if final and final[-1].get("role") == msg.get("role"):
+            # Merge or skip
+            if msg.get("role") == "user":
+                final[-1] = msg  # Keep latest user message
+            else:
+                final[-1] = msg  # Keep latest assistant message
+        else:
+            final.append(msg)
+
+    logger.info(f"Sanitized: {len(messages)} -> {len(final)} messages")
+    return final
 
 
 

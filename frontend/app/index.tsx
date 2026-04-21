@@ -110,7 +110,10 @@ export default function JarvisChat() {
   const checkHealth = useCallback(async (retries = 3) => {
     for (let i = 0; i < retries; i++) {
       try {
-        const res = await fetch(`${BACKEND_URL}/api/health`, { signal: AbortSignal.timeout(15000) });
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15000);
+        const res = await fetch(`${BACKEND_URL}/api/health`, { signal: controller.signal });
+        clearTimeout(timer);
         const data = await res.json();
         if (data.status === 'online') {
           setIsOnline(true);
